@@ -4,5 +4,12 @@
         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
         http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
-    <!-- SQL-formatted changesets are added in later tasks and included here, in order. Never edit an applied one. -->
+    <!-- SQL-formatted changesets, included in order. Only add new ones. Never edit an applied one. -->
+    <include file="db/changelog/changes/001-create-users.sql"/>
+    <include file="db/changelog/changes/002-create-shows.sql"/>
+    <include file="db/changelog/changes/003-create-reservations.sql"/>
+    <include file="db/changelog/changes/004-create-seats.sql"/>
+    <include file="db/changelog/changes/005-create-reservation-seats.sql"/>
+    <include file="db/changelog/changes/006-create-user-show-counts.sql"/>
+    <include file="db/changelog/changes/007-create-idempotency-keys.sql"/>
 </databaseChangeLog>
