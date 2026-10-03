@@ -1,0 +1,53 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-dev-only-root-password}
+      MYSQL_DATABASE: ${DB_NAME:-seat_reservation}
+      MYSQL_USER: ${DB_USER:-seat}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-dev-only-password}
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --binlog-format=ROW
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  app:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    environment:
+      PORT: ${PORT:-8080}
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-seat_reservation}
+      DB_USER: ${DB_USER:-seat}
+      DB_PASSWORD: ${DB_PASSWORD:-dev-only-password}
+      TOKEN_SECRET: ${TOKEN_SECRET:-dev-only-secret}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-only-admin-token}
+      LOG_DIR: /app/logs
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-25}
+      DB_CONNECTION_TIMEOUT_MS: ${DB_CONNECTION_TIMEOUT_MS:-25000}
+      APP_RESERVATION_DEFAULT_MODE: ${APP_RESERVATION_DEFAULT_MODE:-all_or_nothing}
+    volumes:
+      - ./logs:/app/logs
+
+volumes:
+  mysql_data:
