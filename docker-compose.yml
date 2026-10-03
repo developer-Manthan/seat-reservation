@@ -44,6 +44,7 @@ services:
       APP_DB_JDBC_PARAMS: ${APP_DB_JDBC_PARAMS:-allowPublicKeyRetrieval=true&useSSL=false}
       TOKEN_SECRET: ${TOKEN_SECRET:-dev-only-secret}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-only-admin-token}
+      TOKEN_TTL_SECONDS: ${TOKEN_TTL_SECONDS:-86400}
       LOG_DIR: /app/logs
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       APP_DB_POOL_SIZE: ${APP_DB_POOL_SIZE:-25}
