@@ -4,9 +4,9 @@ services:
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-dev-only-root-password}
-      MYSQL_DATABASE: ${DB_NAME:-seat_reservation}
-      MYSQL_USER: ${DB_USER:-seat}
-      MYSQL_PASSWORD: ${DB_PASSWORD:-dev-only-password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-seat_reservation}
+      MYSQL_USER: ${MYSQL_USER:-seat}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-dev-only-password}
       TZ: UTC
     command:
       - --character-set-server=utf8mb4
@@ -34,17 +34,19 @@ services:
       - "${PORT:-8080}:${PORT:-8080}"
     environment:
       PORT: ${PORT:-8080}
-      DB_HOST: mysql
-      DB_PORT: 3306
-      DB_NAME: ${DB_NAME:-seat_reservation}
-      DB_USER: ${DB_USER:-seat}
-      DB_PASSWORD: ${DB_PASSWORD:-dev-only-password}
+      # The app's database. Unset, it uses the local mysql service. Set APP_DB_* to use another MySQL (for example Railway).
+      APP_DB_HOST: ${APP_DB_HOST:-mysql}
+      APP_DB_PORT: ${APP_DB_PORT:-3306}
+      APP_DB_NAME: ${APP_DB_NAME:-${MYSQL_DATABASE:-seat_reservation}}
+      APP_DB_USER: ${APP_DB_USER:-${MYSQL_USER:-seat}}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-${MYSQL_PASSWORD:-dev-only-password}}
+      APP_DB_JDBC_PARAMS: ${APP_DB_JDBC_PARAMS:-allowPublicKeyRetrieval=true&useSSL=false}
       TOKEN_SECRET: ${TOKEN_SECRET:-dev-only-secret}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-only-admin-token}
       LOG_DIR: /app/logs
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-25}
-      DB_CONNECTION_TIMEOUT_MS: ${DB_CONNECTION_TIMEOUT_MS:-25000}
+      APP_DB_POOL_SIZE: ${APP_DB_POOL_SIZE:-25}
+      APP_DB_CONNECTION_TIMEOUT_MS: ${APP_DB_CONNECTION_TIMEOUT_MS:-25000}
       APP_RESERVATION_DEFAULT_MODE: ${APP_RESERVATION_DEFAULT_MODE:-all_or_nothing}
     volumes:
       - ./logs:/app/logs
