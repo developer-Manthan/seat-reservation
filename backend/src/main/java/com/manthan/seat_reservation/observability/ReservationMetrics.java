@@ -22,12 +22,17 @@ public class ReservationMetrics {
 	private final MeterRegistry registry;
 	private final Counter confirmed;
 	private final Counter partial;
+	private final Counter retries;
+	private final Counter throttled;
 
 	public ReservationMetrics(MeterRegistry registry) {
 		this.registry = registry;
 		this.confirmed = Counter.builder("reservations.confirmed").description("Reservations confirmed").register(registry);
 		this.partial = Counter.builder("reservations.partial")
 				.description("best_effort requests that booked fewer seats than requested").register(registry);
+		this.retries = Counter.builder("reservations.retries").description("Reserve attempts retried after a lock conflict")
+				.register(registry);
+		this.throttled = Counter.builder("requests.throttled").description("Requests answered with 429").register(registry);
 		// Register every reason up front so the series exist at 0.
 		List.of(SEAT_TAKEN, PER_USER_LIMIT, IDEMPOTENT_REPLAY, IDEMPOTENCY_CONFLICT).forEach(this::declinedCounter);
 	}
@@ -38,6 +43,14 @@ public class ReservationMetrics {
 
 	public void partial() {
 		partial.increment();
+	}
+
+	public void retried() {
+		retries.increment();
+	}
+
+	public void throttled() {
+		throttled.increment();
 	}
 
 	public void declined(String reason) {

@@ -50,14 +50,16 @@ public class ReservationService {
 	private final ShowRepository showRepository;
 	private final SeatStore store;
 	private final ReserveTransaction reserveTransaction;
+	private final ReserveRetrier retrier;
 	private final ReservationMetrics metrics;
 	private final ReservationMode defaultMode;
 
 	public ReservationService(ShowRepository showRepository, SeatStore store, ReserveTransaction reserveTransaction,
-			ReservationMetrics metrics, @Value("${app.reservation.default-mode:all_or_nothing}") String defaultMode) {
+			ReserveRetrier retrier, ReservationMetrics metrics, @Value("${app.reservation.default-mode:all_or_nothing}") String defaultMode) {
 		this.showRepository = showRepository;
 		this.store = store;
 		this.reserveTransaction = reserveTransaction;
+		this.retrier = retrier;
 		this.metrics = metrics;
 		// An invalid configured default fails the startup instead of failing every request.
 		this.defaultMode = parseMode(defaultMode).orElseThrow(() -> new IllegalStateException(
@@ -91,8 +93,10 @@ public class ReservationService {
 
 		Outcome outcome;
 		try {
-			outcome = reserveTransaction.reserveOnce(new Attempt(userId, showId, show.getPricePaise(),
-					show.getPerUserLimit(), seats, idempotencyKey, requestHash, mode));
+			Attempt attempt = new Attempt(userId, showId, show.getPricePaise(), show.getPerUserLimit(), seats, idempotencyKey,
+					requestHash, mode);
+			// The retry loop wraps the transactional call from outside, so every attempt is a fresh transaction.
+			outcome = retrier.run(() -> reserveTransaction.reserveOnce(attempt));
 		}
 		catch (SeatTakenException e) {
 			metrics.declined(ReservationMetrics.SEAT_TAKEN);

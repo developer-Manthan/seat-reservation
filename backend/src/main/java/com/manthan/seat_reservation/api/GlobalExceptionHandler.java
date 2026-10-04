@@ -3,6 +3,7 @@ package com.manthan.seat_reservation.api;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -15,10 +16,13 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 
 import com.manthan.seat_reservation.auth.ForbiddenException;
 import com.manthan.seat_reservation.auth.UnauthorizedException;
+import com.manthan.seat_reservation.observability.ReservationMetrics;
+import com.manthan.seat_reservation.service.DbFailures;
 import com.manthan.seat_reservation.service.IdempotencyConflictException;
 import com.manthan.seat_reservation.service.InvalidRequestException;
 import com.manthan.seat_reservation.service.PerUserLimitException;
 import com.manthan.seat_reservation.service.SeatTakenException;
+import com.manthan.seat_reservation.service.ServiceBusyException;
 import com.manthan.seat_reservation.service.ShowNameTakenException;
 import com.manthan.seat_reservation.service.ShowNotFoundException;
 
@@ -31,6 +35,14 @@ import com.manthan.seat_reservation.service.ShowNotFoundException;
 public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
 	private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+	private final ReservationMetrics metrics;
+	private final int retryAfterSeconds;
+
+	public GlobalExceptionHandler(ReservationMetrics metrics, @Value("${app.retry-after-seconds:1}") int retryAfterSeconds) {
+		this.metrics = metrics;
+		this.retryAfterSeconds = retryAfterSeconds;
+	}
 
 	@ExceptionHandler(UnauthorizedException.class)
 	ResponseEntity<ErrorResponse> unauthorized(UnauthorizedException e) {
@@ -74,8 +86,17 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 		return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body("bad-request", e.getMessage()));
 	}
 
+	@ExceptionHandler(ServiceBusyException.class)
+	ResponseEntity<ErrorResponse> serviceBusy(ServiceBusyException e) {
+		return tooManyRequests(e.getMessage());
+	}
+
 	@ExceptionHandler(Exception.class)
 	ResponseEntity<ErrorResponse> unexpected(Exception e) {
+		// Pool exhaustion can surface from any endpoint (even the interceptor), wrapped in several exceptions.
+		if (DbFailures.isPoolTimeout(e)) {
+			return tooManyRequests("The database is busy, retry shortly");
+		}
 		log.error("Unexpected exception", e);
 		return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
 				.body(body("internal-error", "Unexpected error"));
@@ -96,6 +117,14 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 		String error = statusCode instanceof HttpStatus s ? s.name().toLowerCase().replace('_', '-') : "error";
 		String message = statusCode.is4xxClientError() ? "Bad request" : "Unexpected error";
 		return ResponseEntity.status(statusCode).headers(headers).body(body(error, message));
+	}
+
+	private ResponseEntity<ErrorResponse> tooManyRequests(String message) {
+		metrics.throttled();
+		log.warn("Responding 429: {}", message);
+		return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+				.header(HttpHeaders.RETRY_AFTER, String.valueOf(retryAfterSeconds))
+				.body(body("too-many-requests", message));
 	}
 
 	/** Field errors name the Java property (userId), the API speaks snake_case (user_id). */
