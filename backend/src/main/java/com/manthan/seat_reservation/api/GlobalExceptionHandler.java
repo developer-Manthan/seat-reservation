@@ -15,6 +15,8 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 
 import com.manthan.seat_reservation.auth.ForbiddenException;
 import com.manthan.seat_reservation.auth.UnauthorizedException;
+import com.manthan.seat_reservation.service.InvalidRequestException;
+import com.manthan.seat_reservation.service.ShowNameTakenException;
 
 /**
  * Maps every known failure to the standard JSON error shape. Spring's own MVC exceptions (bad body, wrong
@@ -36,6 +38,16 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(ForbiddenException.class)
 	ResponseEntity<ErrorResponse> forbidden(ForbiddenException e) {
 		return ResponseEntity.status(HttpStatus.FORBIDDEN).body(body("forbidden", e.getMessage()));
+	}
+
+	@ExceptionHandler(ShowNameTakenException.class)
+	ResponseEntity<ErrorResponse> showNameTaken(ShowNameTakenException e) {
+		return ResponseEntity.status(HttpStatus.CONFLICT).body(body("show-name-taken", e.getMessage()));
+	}
+
+	@ExceptionHandler(InvalidRequestException.class)
+	ResponseEntity<ErrorResponse> invalidRequest(InvalidRequestException e) {
+		return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body("bad-request", e.getMessage()));
 	}
 
 	@ExceptionHandler(Exception.class)

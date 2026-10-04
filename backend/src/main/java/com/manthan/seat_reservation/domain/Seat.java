@@ -11,8 +11,9 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 
 /**
- * Inventory only: no owner fields. Seat state changes only through guarded UPDATE queries, never by
- * loading an entity, checking its status and saving it.
+ * Inventory only: no owner fields. Rows are created once, when a show is created, with persist(). After that,
+ * seat state changes only through guarded UPDATE queries, never by loading an entity, checking its status and
+ * saving it.
  */
 @Entity
 @Table(name = "seats")
@@ -31,5 +32,11 @@ public class Seat {
 
 	@Enumerated(EnumType.STRING)
 	private SeatStatus status;
+
+	public Seat(Long showId, String seatLabel, SeatStatus status) {
+		this.showId = showId;
+		this.seatLabel = seatLabel;
+		this.status = status;
+	}
 
 }

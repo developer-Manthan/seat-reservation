@@ -81,6 +81,13 @@ class SchemaMigrationTest {
 	}
 
 	@Test
+	void showNamesAreUnique() {
+		assertThat(indexColumns("shows", "uk_shows_name")).containsExactly("name");
+		assertThat(jdbc.queryForObject("SELECT non_unique FROM information_schema.statistics WHERE table_schema = DATABASE() "
+				+ "AND table_name = 'shows' AND index_name = 'uk_shows_name' LIMIT 1", Integer.class)).isZero();
+	}
+
+	@Test
 	void seatsHaveNoOwnerColumns() {
 		List<String> seatCols = jdbc.queryForList("SELECT column_name FROM information_schema.columns "
 				+ "WHERE table_schema = DATABASE() AND table_name IN ('seats','reservation_seats')", String.class);

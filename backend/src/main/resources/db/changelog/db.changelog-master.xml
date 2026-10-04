@@ -12,4 +12,5 @@
     <include file="db/changelog/changes/005-create-reservation-seats.sql"/>
     <include file="db/changelog/changes/006-create-user-show-counts.sql"/>
     <include file="db/changelog/changes/007-create-idempotency-keys.sql"/>
+    <include file="db/changelog/changes/008-unique-show-name.sql"/>
 </databaseChangeLog>
