@@ -77,6 +77,7 @@ public class ReserveTransaction {
 		List<String> unavailable = new ArrayList<>();
 		for (String label : attempt.seats()) {
 			if (store.claimSeat(attempt.showId(), label)) {
+				log.debug("Seat {} of show {} claimed", label, attempt.showId());
 				insertReservationSeat(attempt, reservationId, label);
 				won.add(label);
 			}
@@ -84,6 +85,7 @@ public class ReserveTransaction {
 				throw new SeatTakenException(List.of(label));
 			}
 			else {
+				log.debug("Seat {} of show {} not available", label, attempt.showId());
 				unavailable.add(label);
 			}
 		}

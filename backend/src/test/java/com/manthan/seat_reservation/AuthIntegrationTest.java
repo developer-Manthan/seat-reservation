@@ -117,7 +117,8 @@ class AuthIntegrationTest {
 				.andExpect(header().string("WWW-Authenticate", "Bearer"))
 				.andExpect(jsonPath("$.error").value("unauthorized"))
 				.andExpect(jsonPath("$.message").exists())
-				.andExpect(jsonPath("$.trace_id").value(nullValue()));
+				.andExpect(jsonPath("$.trace_id").isNotEmpty())
+				.andExpect(header().exists("X-Trace-Id"));
 	}
 
 	@Test

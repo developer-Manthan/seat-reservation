@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logging setup. You never need to touch this file to add a log: just write log.info("...") in the code.
+  Every line is one JSON object (JSON Lines), written to stdout and to a daily file.
+  What goes into a line (timestamp, level, file, function, message, trace_id, ...) is decided by JsonLogFormatter.
+-->
+<configuration>
+
+    <!-- Where the daily files go. LOG_DIR comes from the environment, default ./logs. Docker sets /app/logs. -->
+    <springProperty scope="context" name="LOG_DIR" source="LOG_DIR" defaultValue="./logs"/>
+
+    <appender name="STDOUT_JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="org.springframework.boot.logging.logback.StructuredLogEncoder">
+            <format>com.manthan.seat_reservation.observability.JsonLogFormatter</format>
+        </encoder>
+    </appender>
+
+    <!--
+      One file per day named ddMMyyyy.log (for example 03102026.log). The day changes at midnight in Asia/Kolkata.
+      There is no <file> property, so the file being written is the dated file itself, and no .gz, so it stays readable.
+      ResilientRollingFileAppender is a normal RollingFileAppender that switches itself off (with a warning) when the
+      folder cannot be written, instead of stopping the application from starting.
+    -->
+    <appender name="FILE_JSON" class="com.manthan.seat_reservation.observability.ResilientRollingFileAppender">
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/%d{ddMMyyyy,Asia/Kolkata}.log</fileNamePattern>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder class="org.springframework.boot.logging.logback.StructuredLogEncoder">
+            <format>com.manthan.seat_reservation.observability.JsonLogFormatter</format>
+        </encoder>
+    </appender>
+
+    <!--
+      Async, so logging never slows a request down. discardingThreshold 0 means no line is ever dropped.
+      includeCallerData records where the log call was written (file and function) before the line is handed over.
+    -->
+    <appender name="ASYNC_STDOUT" class="ch.qos.logback.classic.AsyncAppender">
+        <queueSize>10000</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <includeCallerData>true</includeCallerData>
+        <appender-ref ref="STDOUT_JSON"/>
+    </appender>
+
+    <appender name="ASYNC_FILE" class="ch.qos.logback.classic.AsyncAppender">
+        <queueSize>10000</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <includeCallerData>true</includeCallerData>
+        <appender-ref ref="FILE_JSON"/>
+    </appender>
+
+    <!-- The level comes from LOG_LEVEL (logging.level.root in application.properties). -->
+    <root level="INFO">
+        <appender-ref ref="ASYNC_STDOUT"/>
+        <appender-ref ref="ASYNC_FILE"/>
+    </root>
+
+</configuration>
