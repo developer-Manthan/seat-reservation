@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seat Reservation</title>
+<style>
+  :root { --ink:#1c2430; --muted:#667085; --line:#d9dee7; --bg:#f5f7fa; --card:#fff; --accent:#2f5bea; --ok:#1a7f4b; --bad:#c0362c; --mine:#2f5bea; --taken:#c9ced8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--ink); background:var(--bg); }
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:12px 16px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; margin-right:auto; }
+  main { max-width:900px; margin:0 auto; padding:16px; }
+  h2 { font-size:18px; margin:4px 0 12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:13px; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size:13px; overflow-wrap:anywhere; }
+  button { font:inherit; padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  input, select { font:inherit; padding:7px 9px; border:1px solid var(--line); border-radius:6px; min-width:0; }
+  label { display:flex; flex-direction:column; gap:4px; font-size:13px; color:var(--muted); }
+  .list { list-style:none; margin:0; padding:0; }
+  .list li { display:flex; gap:10px; align-items:center; padding:9px 4px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .list li:last-child { border-bottom:0; }
+  .grow { flex:1 1 220px; min-width:0; }
+  .badge { font-size:12px; padding:2px 8px; border-radius:999px; background:var(--bg); border:1px solid var(--line); }
+  .msg { padding:9px 12px; border-radius:6px; margin:10px 0; display:none; }
+  .msg.ok { display:block; background:#e8f5ee; color:var(--ok); }
+  .msg.bad { display:block; background:#fdecea; color:var(--bad); }
+  .seats { display:flex; flex-direction:column; gap:6px; margin:10px 0; overflow-x:auto; }
+  .seat-row { display:flex; gap:6px; }
+  .seat { min-width:48px; padding:8px 4px; text-align:center; font-size:13px; }
+  .seat.taken { background:var(--taken); color:#fff; border-color:var(--taken); }
+  .seat.mine { background:var(--mine); color:#fff; border-color:var(--mine); }
+  .seat.taken:disabled, .seat.mine:disabled { opacity:1; }
+  .seat.picked { outline:3px solid var(--accent); outline-offset:1px; }
+  .legend span { display:inline-flex; align-items:center; gap:5px; margin-right:12px; font-size:13px; color:var(--muted); }
+  .swatch { width:14px; height:14px; border-radius:3px; border:1px solid var(--line); display:inline-block; }
+  details summary { cursor:pointer; font-weight:600; }
+  .form { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-top:12px; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Seat Reservation</h1>
+  <span id="who" class="muted hidden">You are <span id="whoId" class="mono"></span></span>
+  <button id="changeUser" class="hidden">Change user</button>
+</header>
+
+<main>
+  <div id="message" class="msg" role="status"></div>
+
+  <!-- 1. Pick a user -->
+  <section id="viewUsers" class="hidden">
+    <div class="card">
+      <div class="row">
+        <h2 class="grow">Who are you?</h2>
+        <input id="userFilter" placeholder="Filter by id" aria-label="Filter users by id">
+        <button id="addUser" class="primary">Add user</button>
+      </div>
+      <p class="muted">Pick a user id to continue. This is a demo, so there is no password.</p>
+      <ul id="userList" class="list"></ul>
+    </div>
+  </section>
+
+  <!-- 2. Shows -->
+  <section id="viewShows" class="hidden">
+    <div class="card">
+      <div class="row"><h2 class="grow">Shows</h2><button id="refreshShows">Refresh</button></div>
+      <ul id="showList" class="list"></ul>
+    </div>
+    <div class="card">
+      <details>
+        <summary>Create a show (needs the admin token)</summary>
+        <div class="form">
+          <label>Admin token <input id="adminToken" type="password" autocomplete="off"></label>
+          <label>Name <input id="newName" maxlength="255"></label>
+          <label>Price (rupees) <input id="newPrice" inputmode="decimal" value="250"></label>
+          <label>Rows, comma separated <input id="newRows" value="A,B,C"></label>
+          <label>Seats per row <input id="newPerRow" type="number" min="1" value="8"></label>
+          <label>Seats per user <input id="newLimit" type="number" min="1" value="4"></label>
+        </div>
+        <p><button id="createShow" class="primary">Create show</button></p>
+      </details>
+    </div>
+  </section>
+
+  <!-- 3. One show: book and cancel -->
+  <section id="viewShow" class="hidden">
+    <p><button id="backToShows">&larr; All shows</button></p>
+    <div class="card">
+      <div class="row">
+        <h2 id="showName" class="grow"></h2>
+        <span id="showCounts" class="badge"></span>
+        <button id="refreshShow">Refresh</button>
+      </div>
+      <p id="showInfo" class="muted"></p>
+      <div class="legend">
+        <span><i class="swatch"></i>available</span>
+        <span><i class="swatch" style="background:var(--mine);border-color:var(--mine)"></i>yours</span>
+        <span><i class="swatch" style="background:var(--taken);border-color:var(--taken)"></i>taken</span>
+      </div>
+      <div id="seatGrid" class="seats"></div>
+      <div class="row">
+        <label>If some seats are taken
+          <select id="mode">
+            <option value="all_or_nothing">book all of them or none</option>
+            <option value="best_effort">book whichever are free</option>
+          </select>
+        </label>
+        <span id="selection" class="grow muted"></span>
+        <button id="book" class="primary" disabled>Book</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Your reservations for this show</h2>
+      <ul id="myReservations" class="list"></ul>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ---- state ----
+const state = { userId: null, token: null, show: null, reservations: [], picked: new Set(), mine: new Set(), pendingKey: null, timer: null };
+const $ = id => document.getElementById(id);
+
+// ---- helpers ----
+function el(tag, props = {}, ...children) {
+  const node = Object.assign(document.createElement(tag), props);
+  for (const child of children) node.append(child);          // append() inserts strings as text, never as HTML
+  return node;
+}
+function uuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+function rupees(paise) { return "₹" + Math.floor(paise / 100) + "." + String(paise % 100).padStart(2, "0"); }
+function toPaise(text) {
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text.trim());
+  return match ? Number(match[1]) * 100 + Number((match[2] || "").padEnd(2, "0")) : null;
+}
+function say(text, good) {
+  const box = $("message");
+  box.textContent = text || "";
+  box.className = "msg" + (text ? (good ? " ok" : " bad") : "");
+}
+/** Calls the API. Returns { ok, status, body, traceId }. A token, when given, is sent as a Bearer header. */
+async function api(method, path, body, token) {
+  const headers = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (token) headers["Authorization"] = "Bearer " + token;
+  try {
+    const response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const text = await response.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch (e) { parsed = null; }
+    return { ok: response.ok, status: response.status, body: parsed, traceId: response.headers.get("X-Trace-Id") };
+  } catch (e) {
+    return { ok: false, status: 0, body: { error: "network", message: "Could not reach the server" }, traceId: null };
+  }
+}
+function problem(result) {
+  const b = result.body || {};
+  return `${b.error || "error"} (${result.status}): ${b.message || "Request failed"}` + (result.traceId ? ` — trace ${result.traceId}` : "");
+}
+function show(view) {
+  for (const id of ["viewUsers", "viewShows", "viewShow"]) $(id).classList.toggle("hidden", id !== view);
+  const signedIn = !!state.userId;
+  $("who").classList.toggle("hidden", !signedIn);
+  $("changeUser").classList.toggle("hidden", !signedIn);
+  $("whoId").textContent = state.userId || "";
+  clearInterval(state.timer);
+  state.timer = null;
+}
+
+// ---- 1. users ----
+async function openUsers() {
+  state.userId = state.token = null;
+  sessionStorage.removeItem("userId");
+  show("viewUsers");
+  await loadUsers();
+}
+async function loadUsers() {
+  const result = await api("GET", "/users");
+  if (!result.ok) return say(problem(result));
+  const filter = $("userFilter").value.trim().toLowerCase();
+  const list = $("userList");
+  list.replaceChildren();
+  const users = result.body.filter(u => u.user_id.includes(filter));
+  if (!users.length) list.append(el("li", { className: "muted" }, filter ? "No user matches." : "No users yet. Add one."));
+  for (const user of users) {
+    const pick = el("button", { className: "primary" }, "Continue as this user");
+    pick.onclick = () => signIn(user.user_id);
+    list.append(el("li", {}, el("span", { className: "mono grow" }, user.user_id),
+      el("span", { className: "muted" }, new Date(user.created_at).toLocaleString()), pick));
+  }
+}
+async function addUser() {
+  const id = uuid();
+  const result = await api("POST", "/auth/token", { user_id: id });     // this endpoint creates the user
+  if (!result.ok) return say(problem(result));
+  say("Added user " + id, true);
+  $("userFilter").value = "";
+  await loadUsers();
+}
+async function signIn(userId) {
+  const result = await api("POST", "/auth/token", { user_id: userId });
+  if (!result.ok) return say(problem(result));
+  state.userId = result.body.user_id;
+  state.token = result.body.token;
+  sessionStorage.setItem("userId", state.userId);
+  say("");
+  await openShows();
+}
+
+// ---- 2. shows ----
+async function openShows() {
+  show("viewShows");
+  await loadShows();
+}
+async function loadShows() {
+  const result = await api("GET", "/shows", undefined, state.token);
+  if (!result.ok) return say(problem(result));
+  const list = $("showList");
+  list.replaceChildren();
+  if (!result.body.length) list.append(el("li", { className: "muted" }, "No shows yet. Create one below."));
+  for (const s of result.body) {
+    const open = el("button", { className: "primary" }, s.available ? "Book seats" : "View");
+    open.onclick = () => openShow(s.id);
+    list.append(el("li", {},
+      el("span", { className: "grow" }, el("strong", {}, s.name), el("div", { className: "muted" }, `${rupees(s.price_paise)} per seat · up to ${s.per_user_limit} per user`)),
+      el("span", { className: "badge" }, s.available ? `${s.available} of ${s.total_seats} available` : "sold out"), open));
+  }
+}
+async function createShow() {
+  const price = toPaise($("newPrice").value);
+  const rows = $("newRows").value.split(",").map(r => r.trim()).filter(Boolean);
+  const perRow = Number($("newPerRow").value);
+  if (price === null) return say("Price must be a number like 250 or 249.50");
+  if (!rows.length || !Number.isInteger(perRow) || perRow < 1) return say("Give at least one row and a number of seats per row");
+  const seats = rows.flatMap(row => Array.from({ length: perRow }, (_, i) => row + (i + 1)));
+  const result = await api("POST", "/shows", { name: $("newName").value, price_paise: price, per_user_limit: Number($("newLimit").value), seats }, $("adminToken").value.trim());
+  if (!result.ok) return say(problem(result));
+  say(`Created "${result.body.name}" with ${result.body.total_seats} seats`, true);
+  $("newName").value = "";
+  await loadShows();
+}
+
+// ---- 3. one show ----
+async function openShow(showId) {
+  state.picked = new Set();
+  state.pendingKey = null;
+  show("viewShow");
+  await loadShow(showId);
+  state.timer = setInterval(() => loadShow(showId, true), 5000);      // other people book too
+}
+async function loadShow(showId, quiet) {
+  const [showResult, mineResult] = await Promise.all([
+    api("GET", "/shows/" + showId, undefined, state.token),
+    api("GET", "/reservations?show_id=" + showId, undefined, state.token)]);
+  if (!showResult.ok || !mineResult.ok) { if (!quiet) say(problem(showResult.ok ? mineResult : showResult)); return; }
+  state.show = showResult.body;
+  state.reservations = mineResult.body;
+  const active = mineResult.body.filter(r => r.status === "confirmed");
+  state.mine = new Set(active.flatMap(r => r.seats));
+  for (const label of [...state.picked]) {                               // a seat picked earlier may be gone now
+    const seat = state.show.seats.find(s => s.seat_label === label);
+    if (!seat || seat.status !== "available") state.picked.delete(label);
+  }
+  renderShow(state.reservations);
+}
+function renderShow(reservations) {
+  const s = state.show;
+  $("showName").textContent = s.name;
+  $("showCounts").textContent = `${s.counts.available} of ${s.total_seats} available`;
+  $("showInfo").textContent = `${rupees(s.price_paise)} per seat · you hold ${state.mine.size} of ${s.per_user_limit} allowed`;
+
+  const grid = $("seatGrid");
+  grid.replaceChildren();
+  const rows = new Map();                                                // group A1, A2 ... by the part before the number
+  for (const seat of s.seats) {
+    const key = seat.seat_label.replace(/\d+$/, "");
+    if (!rows.has(key)) rows.set(key, []);
+    rows.get(key).push(seat);
+  }
+  for (const seats of rows.values()) {
+    const row = el("div", { className: "seat-row" });
+    for (const seat of seats) {
+      const mine = state.mine.has(seat.seat_label);
+      const free = seat.status === "available";
+      const button = el("button", { className: "seat" + (mine ? " mine" : free ? "" : " taken") + (state.picked.has(seat.seat_label) ? " picked" : "") }, seat.seat_label);
+      button.disabled = !free;
+      button.title = mine ? "Your seat" : free ? "Available" : "Taken";
+      button.onclick = () => togglePick(seat.seat_label);
+      row.append(button);
+    }
+    grid.append(row);
+  }
+  renderSelection();
+
+  const list = $("myReservations");
+  list.replaceChildren();
+  if (!reservations.length) list.append(el("li", { className: "muted" }, "You have no reservations for this show."));
+  for (const r of reservations) {
+    const item = el("li", {},
+      el("span", { className: "grow" },
+        el("strong", {}, r.status === "confirmed" ? "Seats " + r.seats.join(", ") : "Cancelled"),
+        el("div", { className: "muted" }, `${rupees(r.amount_paise)} · ${new Date(r.created_at).toLocaleString()}`),
+        el("div", { className: "mono muted" }, r.reservation_id)),
+      el("span", { className: "badge" }, r.status));
+    if (r.status === "confirmed") {
+      const cancel = el("button", { className: "danger" }, "Cancel");
+      cancel.onclick = () => cancelReservation(r.reservation_id);
+      item.append(cancel);
+    }
+    list.append(item);
+  }
+}
+function togglePick(label) {
+  state.picked.has(label) ? state.picked.delete(label) : state.picked.add(label);
+  state.pendingKey = null;                                               // a different selection is a different request
+  renderShow(state.reservations);
+}
+function renderSelection() {
+  const picked = [...state.picked];
+  $("selection").textContent = picked.length ? `${picked.length} seat(s): ${picked.join(", ")} · ${rupees(picked.length * state.show.price_paise)}` : "Click seats to select them.";
+  $("book").disabled = !picked.length;
+}
+async function book() {
+  const seats = [...state.picked];
+  // The same key is reused if this exact request is sent again, so a double click or a retry never books twice.
+  state.pendingKey = state.pendingKey || uuid();
+  $("book").disabled = true;
+  const result = await api("POST", `/shows/${state.show.id}/reserve`, { seats, idempotency_key: state.pendingKey, mode: $("mode").value }, state.token);
+  if (result.status !== 0) state.pendingKey = null;                      // got an answer: the next booking is a new request
+  if (result.ok) {
+    const missed = result.body.unavailable_seats;
+    say(`Booked ${result.body.seats.join(", ")} for ${rupees(result.body.amount_paise)}` + (missed ? `. Not available: ${missed.join(", ")}` : ""), true);
+    state.picked = new Set();
+  } else {
+    say(problem(result));
+  }
+  await loadShow(state.show.id, true);
+}
+async function cancelReservation(id) {
+  const result = await api("POST", `/reservations/${id}/cancel`, undefined, state.token);
+  say(result.ok ? `Cancelled. Seats ${result.body.released_seats.join(", ")} are free again.` : problem(result), result.ok);
+  await loadShow(state.show.id, true);
+}
+
+// ---- wiring ----
+$("changeUser").onclick = openUsers;
+$("addUser").onclick = addUser;
+$("userFilter").oninput = loadUsers;
+$("refreshShows").onclick = loadShows;
+$("createShow").onclick = createShow;
+$("backToShows").onclick = openShows;
+$("refreshShow").onclick = () => loadShow(state.show.id);
+$("book").onclick = book;
+
+// Start: come back as the same user after a page reload, otherwise ask who you are.
+const remembered = sessionStorage.getItem("userId");
+remembered ? signIn(remembered) : openUsers();
+</script>
+</body>
+</html>

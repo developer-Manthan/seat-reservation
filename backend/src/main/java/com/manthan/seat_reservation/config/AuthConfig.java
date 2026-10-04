@@ -26,12 +26,15 @@ public class AuthConfig implements WebMvcConfigurer {
 		return Clock.systemUTC();
 	}
 
-	/** POST /auth/token is skipped inside the interceptor, because a path pattern cannot match on the method. */
+	/**
+	 * Open paths: health, the UI page itself, and GET /users (the UI lists users before anyone has a token).
+	 * POST /auth/token is skipped inside the interceptor, because a path pattern cannot match on the method.
+	 */
 	@Override
 	public void addInterceptors(InterceptorRegistry registry) {
 		registry.addInterceptor(authInterceptor)
 				.addPathPatterns("/**")
-				.excludePathPatterns("/healthz", "/readyz", "/actuator/health", "/actuator/health/**");
+				.excludePathPatterns("/healthz", "/readyz", "/actuator/health", "/actuator/health/**", "/", "/index.html", "/users");
 	}
 
 }
