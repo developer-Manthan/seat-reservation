@@ -50,10 +50,30 @@
         <appender-ref ref="FILE_JSON"/>
     </appender>
 
+    <!--
+      Optional: also send every line to Grafana Loki. This happens only when LOKI_URL is set, for example
+      LOKI_URL=http://loki.railway.internal:3100. With no LOKI_URL the appender stays switched off.
+      The line sent is the same JSON as above. Lines go out in the background in small batches. If Loki cannot be
+      reached they are dropped after a few retries, and the app carries on: stdout and the daily file are unaffected.
+    -->
+    <springProperty scope="context" name="LOKI_URL" source="LOKI_URL" defaultValue=""/>
+    <appender name="LOKI" class="com.manthan.seat_reservation.observability.OptionalLokiAppender">
+        <lokiUrl>${LOKI_URL}</lokiUrl>
+        <labels>
+            app = seat-reservation
+            level = %level
+        </labels>
+        <message class="com.manthan.seat_reservation.observability.JsonLogLayout"/>
+        <batch>
+            <timeoutMs>5000</timeoutMs>
+        </batch>
+    </appender>
+
     <!-- The level comes from LOG_LEVEL (logging.level.root in application.properties). -->
     <root level="INFO">
         <appender-ref ref="ASYNC_STDOUT"/>
         <appender-ref ref="ASYNC_FILE"/>
+        <appender-ref ref="LOKI"/>
     </root>
 
 </configuration>
