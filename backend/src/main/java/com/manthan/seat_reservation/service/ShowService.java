@@ -1,21 +1,31 @@
 package com.manthan.seat_reservation.service;
 
+import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.manthan.seat_reservation.domain.SeatLabels;
+import com.manthan.seat_reservation.domain.SeatStatus;
 import com.manthan.seat_reservation.domain.Show;
 import com.manthan.seat_reservation.repository.SeatInventoryRepository;
+import com.manthan.seat_reservation.repository.SeatReadRepository;
+import com.manthan.seat_reservation.repository.SeatReadRepository.SeatRow;
 import com.manthan.seat_reservation.repository.ShowRepository;
 
 @Service
 public class ShowService {
+
+	private static final Logger log = LoggerFactory.getLogger(ShowService.class);
 
 	public static final int DEFAULT_PER_USER_LIMIT = 4;
 
@@ -23,15 +33,41 @@ public class ShowService {
 	public record CreatedShow(Show show, List<String> seatLabels) {
 	}
 
+	/** A show with every seat in natural label order and the count per status, all from one seat query. */
+	public record ShowView(Show show, List<SeatRow> seats, Map<SeatStatus, Integer> counts) {
+	}
+
 	private final ShowRepository showRepository;
 	private final SeatInventoryRepository seatInventory;
+	private final SeatReadRepository seatReads;
 	private final int maxSeats;
 
 	public ShowService(ShowRepository showRepository, SeatInventoryRepository seatInventory,
-			@Value("${app.shows.max-seats:5000}") int maxSeats) {
+			SeatReadRepository seatReads, @Value("${app.shows.max-seats:5000}") int maxSeats) {
 		this.showRepository = showRepository;
 		this.seatInventory = seatInventory;
+		this.seatReads = seatReads;
 		this.maxSeats = maxSeats;
+	}
+
+	/**
+	 * Counts are derived from the seat rows that are returned, so they always add up to the seats shown, even
+	 * while reservations are committing. The stored total_seats never changes after creation.
+	 */
+	@Transactional(readOnly = true)
+	public ShowView getShow(long id) {
+		Show show = showRepository.findById(id).orElseThrow(() -> new ShowNotFoundException(id));
+		List<SeatRow> seats = seatReads.findByShowId(id).stream()
+				.sorted(Comparator.comparing(SeatRow::getSeatLabel, SeatLabels.NATURAL_ORDER)).toList();
+		Map<SeatStatus, Integer> counts = new EnumMap<>(SeatStatus.class);
+		for (SeatStatus status : SeatStatus.values()) {
+			counts.put(status, 0);
+		}
+		seats.forEach(seat -> counts.merge(seat.getStatus(), 1, Integer::sum));
+		if (seats.size() != show.getTotalSeats()) {
+			log.error("Invariant violated for show {}: {} seats stored, total_seats is {}", id, seats.size(), show.getTotalSeats());
+		}
+		return new ShowView(show, seats, counts);
 	}
 
 	/** The show and all its seats are created in one transaction, so a failure leaves no partial show. */

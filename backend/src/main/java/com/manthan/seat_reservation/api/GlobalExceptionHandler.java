@@ -17,6 +17,7 @@ import com.manthan.seat_reservation.auth.ForbiddenException;
 import com.manthan.seat_reservation.auth.UnauthorizedException;
 import com.manthan.seat_reservation.service.InvalidRequestException;
 import com.manthan.seat_reservation.service.ShowNameTakenException;
+import com.manthan.seat_reservation.service.ShowNotFoundException;
 
 /**
  * Maps every known failure to the standard JSON error shape. Spring's own MVC exceptions (bad body, wrong
@@ -38,6 +39,11 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(ForbiddenException.class)
 	ResponseEntity<ErrorResponse> forbidden(ForbiddenException e) {
 		return ResponseEntity.status(HttpStatus.FORBIDDEN).body(body("forbidden", e.getMessage()));
+	}
+
+	@ExceptionHandler(ShowNotFoundException.class)
+	ResponseEntity<ErrorResponse> showNotFound(ShowNotFoundException e) {
+		return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body("not-found", e.getMessage()));
 	}
 
 	@ExceptionHandler(ShowNameTakenException.class)
