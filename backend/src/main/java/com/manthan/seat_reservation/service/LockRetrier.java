@@ -14,15 +14,15 @@ import org.springframework.stereotype.Component;
 import com.manthan.seat_reservation.observability.ReservationMetrics;
 
 /**
- * Runs a transactional call again after a deadlock or lock timeout, with a small random backoff. It must wrap the
- * call from OUTSIDE the transaction, so every attempt is a fresh one. Only lock failures are retried. Domain
+ * Runs a transactional call (reserve or cancel) again after a deadlock or lock timeout, with a small random backoff.
+ * It must wrap the call from OUTSIDE the transaction, so every attempt is a fresh one. Only lock failures are retried. Domain
  * declines and every other exception propagate untouched. A pool timeout is not retried (it already waited for the
  * connection timeout). Exhausted retries and pool timeouts both end as {@link ServiceBusyException}, which is a 429.
  */
 @Component
-public class ReserveRetrier {
+public class LockRetrier {
 
-	private static final Logger log = LoggerFactory.getLogger(ReserveRetrier.class);
+	private static final Logger log = LoggerFactory.getLogger(LockRetrier.class);
 
 	/** Sleeps between attempts. A seam so tests do not really wait. */
 	@FunctionalInterface
@@ -38,14 +38,14 @@ public class ReserveRetrier {
 	private final ReservationMetrics metrics;
 
 	@Autowired
-	public ReserveRetrier(@Value("${app.reservation.retry.max-attempts:5}") int maxAttempts,
+	public LockRetrier(@Value("${app.reservation.retry.max-attempts:5}") int maxAttempts,
 			@Value("${app.reservation.retry.base-backoff-ms:10}") long baseBackoffMs,
 			@Value("${app.reservation.retry.max-backoff-ms:200}") long maxBackoffMs, ReservationMetrics metrics) {
 		this(maxAttempts, baseBackoffMs, maxBackoffMs, Thread::sleep,
 				bound -> ThreadLocalRandom.current().nextLong(bound + 1), metrics);
 	}
 
-	public ReserveRetrier(int maxAttempts, long baseBackoffMs, long maxBackoffMs, Sleeper sleeper,
+	public LockRetrier(int maxAttempts, long baseBackoffMs, long maxBackoffMs, Sleeper sleeper,
 			LongUnaryOperator randomUpTo, ReservationMetrics metrics) {
 		if (maxAttempts < 1) {
 			throw new IllegalArgumentException("app.reservation.retry.max-attempts must be at least 1");

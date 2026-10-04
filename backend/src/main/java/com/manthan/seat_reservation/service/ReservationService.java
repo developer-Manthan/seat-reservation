@@ -50,12 +50,12 @@ public class ReservationService {
 	private final ShowRepository showRepository;
 	private final SeatStore store;
 	private final ReserveTransaction reserveTransaction;
-	private final ReserveRetrier retrier;
+	private final LockRetrier retrier;
 	private final ReservationMetrics metrics;
 	private final ReservationMode defaultMode;
 
 	public ReservationService(ShowRepository showRepository, SeatStore store, ReserveTransaction reserveTransaction,
-			ReserveRetrier retrier, ReservationMetrics metrics, @Value("${app.reservation.default-mode:all_or_nothing}") String defaultMode) {
+			LockRetrier retrier, ReservationMetrics metrics, @Value("${app.reservation.default-mode:all_or_nothing}") String defaultMode) {
 		this.showRepository = showRepository;
 		this.store = store;
 		this.reserveTransaction = reserveTransaction;

@@ -16,6 +16,8 @@ import com.manthan.seat_reservation.auth.ForbiddenException;
 import com.manthan.seat_reservation.auth.Principal;
 import com.manthan.seat_reservation.domain.ReservationStatus;
 import com.manthan.seat_reservation.service.InvalidRequestException;
+import com.manthan.seat_reservation.service.CancellationService;
+import com.manthan.seat_reservation.service.CancellationService.CancelResult;
 import com.manthan.seat_reservation.service.ReservationService;
 import com.manthan.seat_reservation.service.ReservationService.ReservationResult;
 
@@ -29,9 +31,11 @@ import jakarta.validation.constraints.Size;
 public class ReservationController {
 
 	private final ReservationService reservationService;
+	private final CancellationService cancellationService;
 
-	public ReservationController(ReservationService reservationService) {
+	public ReservationController(ReservationService reservationService, CancellationService cancellationService) {
 		this.reservationService = reservationService;
+		this.cancellationService = cancellationService;
 	}
 
 	/**
@@ -80,6 +84,27 @@ public class ReservationController {
 			throw new InvalidRequestException("idempotency_key: is required (body field or Idempotency-Key header)");
 		}
 		return key;
+	}
+
+	public record CancelResponse(@JsonProperty("reservation_id") String reservationId, @JsonProperty("show_id") long showId,
+			ReservationStatus status, @JsonProperty("amount_paise") long amountPaise,
+			@JsonProperty("released_seats") List<String> releasedSeats) {
+
+		static CancelResponse of(CancelResult result) {
+			return new CancelResponse(result.reservationId(), result.showId(), ReservationStatus.cancelled,
+					result.amountPaise(), result.releasedSeats());
+		}
+
+	}
+
+	/** Owner only: the owner check is part of the guarded update, so another user's reservation is a plain 404. */
+	@PostMapping("/reservations/{id}/cancel")
+	public CancelResponse cancel(@PathVariable("id") String reservationId,
+			@RequestAttribute(Principal.ATTRIBUTE) Principal principal) {
+		if (principal.userId() == null) {
+			throw new ForbiddenException("Admin tokens cannot cancel reservations");
+		}
+		return CancelResponse.of(cancellationService.cancel(principal.userId(), reservationId));
 	}
 
 }

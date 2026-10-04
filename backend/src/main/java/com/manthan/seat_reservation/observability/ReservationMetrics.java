@@ -22,6 +22,7 @@ public class ReservationMetrics {
 	private final MeterRegistry registry;
 	private final Counter confirmed;
 	private final Counter partial;
+	private final Counter cancelled;
 	private final Counter retries;
 	private final Counter throttled;
 
@@ -30,6 +31,7 @@ public class ReservationMetrics {
 		this.confirmed = Counter.builder("reservations.confirmed").description("Reservations confirmed").register(registry);
 		this.partial = Counter.builder("reservations.partial")
 				.description("best_effort requests that booked fewer seats than requested").register(registry);
+		this.cancelled = Counter.builder("reservations.cancelled").description("Reservations cancelled").register(registry);
 		this.retries = Counter.builder("reservations.retries").description("Reserve attempts retried after a lock conflict")
 				.register(registry);
 		this.throttled = Counter.builder("requests.throttled").description("Requests answered with 429").register(registry);
@@ -43,6 +45,10 @@ public class ReservationMetrics {
 
 	public void partial() {
 		partial.increment();
+	}
+
+	public void cancelled() {
+		cancelled.increment();
 	}
 
 	public void retried() {

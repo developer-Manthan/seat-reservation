@@ -19,20 +19,20 @@ import org.springframework.transaction.CannotCreateTransactionException;
 
 import com.manthan.seat_reservation.observability.ReservationMetrics;
 import com.manthan.seat_reservation.service.PerUserLimitException;
-import com.manthan.seat_reservation.service.ReserveRetrier;
+import com.manthan.seat_reservation.service.LockRetrier;
 import com.manthan.seat_reservation.service.SeatTakenException;
 import com.manthan.seat_reservation.service.ServiceBusyException;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
-class ReserveRetrierTest {
+class LockRetrierTest {
 
 	private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
 	private final ReservationMetrics metrics = new ReservationMetrics(registry);
 	private final List<Long> sleeps = new ArrayList<>();
 
-	private ReserveRetrier retrier(int maxAttempts) {
-		return new ReserveRetrier(maxAttempts, 10, 200, sleeps::add, bound -> bound, metrics);
+	private LockRetrier retrier(int maxAttempts) {
+		return new LockRetrier(maxAttempts, 10, 200, sleeps::add, bound -> bound, metrics);
 	}
 
 	private double retries() {
@@ -143,7 +143,7 @@ class ReserveRetrierTest {
 
 	@Test
 	void backoffDoublesFromTheBaseAndStopsAtTheCap() {
-		ReserveRetrier retrier = retrier(10);
+		LockRetrier retrier = retrier(10);
 
 		// The fake random always picks the upper bound, so these are the ceilings: 10, 20, 40, 80, 160, then capped at 200.
 		assertThat(List.of(retrier.backoff(1), retrier.backoff(2), retrier.backoff(3), retrier.backoff(4), retrier.backoff(5),
@@ -153,12 +153,12 @@ class ReserveRetrierTest {
 
 	@Test
 	void backoffIsRandomWithinTheCeiling() {
-		ReserveRetrier real = new ReserveRetrier(5, 10, 200, millis -> { }, bound -> java.util.concurrent.ThreadLocalRandom.current().nextLong(bound + 1), metrics);
+		LockRetrier real = new LockRetrier(5, 10, 200, millis -> { }, bound -> java.util.concurrent.ThreadLocalRandom.current().nextLong(bound + 1), metrics);
 
 		for (int i = 0; i < 500; i++) {
 			assertThat(real.backoff(3)).isBetween(0L, 40L);
 		}
-		assertThat(new ReserveRetrier(5, 10, 200, millis -> { }, bound -> 0, metrics).backoff(4)).isZero();
+		assertThat(new LockRetrier(5, 10, 200, millis -> { }, bound -> 0, metrics).backoff(4)).isZero();
 	}
 
 	@Test
@@ -189,7 +189,7 @@ class ReserveRetrierTest {
 
 	@Test
 	void anInterruptedSleepAnswersBusyAndKeepsTheInterruptFlag() {
-		ReserveRetrier interrupted = new ReserveRetrier(5, 10, 200, millis -> {
+		LockRetrier interrupted = new LockRetrier(5, 10, 200, millis -> {
 			throw new InterruptedException();
 		}, bound -> bound, metrics);
 		AtomicInteger calls = new AtomicInteger();
@@ -206,7 +206,7 @@ class ReserveRetrierTest {
 
 	@Test
 	void aMaximumOfZeroAttemptsIsRejected() {
-		assertThatThrownBy(() -> new ReserveRetrier(0, 10, 200, sleeps::add, bound -> bound, metrics))
+		assertThatThrownBy(() -> new LockRetrier(0, 10, 200, sleeps::add, bound -> bound, metrics))
 				.isInstanceOf(IllegalArgumentException.class);
 	}
 

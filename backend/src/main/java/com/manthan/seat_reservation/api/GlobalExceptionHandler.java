@@ -17,10 +17,12 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 import com.manthan.seat_reservation.auth.ForbiddenException;
 import com.manthan.seat_reservation.auth.UnauthorizedException;
 import com.manthan.seat_reservation.observability.ReservationMetrics;
+import com.manthan.seat_reservation.service.AlreadyCancelledException;
 import com.manthan.seat_reservation.service.DbFailures;
 import com.manthan.seat_reservation.service.IdempotencyConflictException;
 import com.manthan.seat_reservation.service.InvalidRequestException;
 import com.manthan.seat_reservation.service.PerUserLimitException;
+import com.manthan.seat_reservation.service.ReservationNotFoundException;
 import com.manthan.seat_reservation.service.SeatTakenException;
 import com.manthan.seat_reservation.service.ServiceBusyException;
 import com.manthan.seat_reservation.service.ShowNameTakenException;
@@ -69,6 +71,16 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(IdempotencyConflictException.class)
 	ResponseEntity<ErrorResponse> idempotencyConflict(IdempotencyConflictException e) {
 		return ResponseEntity.status(HttpStatus.CONFLICT).body(body("idempotency-conflict", e.getMessage()));
+	}
+
+	@ExceptionHandler(ReservationNotFoundException.class)
+	ResponseEntity<ErrorResponse> reservationNotFound(ReservationNotFoundException e) {
+		return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body("not-found", e.getMessage()));
+	}
+
+	@ExceptionHandler(AlreadyCancelledException.class)
+	ResponseEntity<ErrorResponse> alreadyCancelled(AlreadyCancelledException e) {
+		return ResponseEntity.status(HttpStatus.CONFLICT).body(body("already-cancelled", e.getMessage()));
 	}
 
 	@ExceptionHandler(ShowNotFoundException.class)
