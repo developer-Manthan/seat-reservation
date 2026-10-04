@@ -15,7 +15,10 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 
 import com.manthan.seat_reservation.auth.ForbiddenException;
 import com.manthan.seat_reservation.auth.UnauthorizedException;
+import com.manthan.seat_reservation.service.IdempotencyConflictException;
 import com.manthan.seat_reservation.service.InvalidRequestException;
+import com.manthan.seat_reservation.service.PerUserLimitException;
+import com.manthan.seat_reservation.service.SeatTakenException;
 import com.manthan.seat_reservation.service.ShowNameTakenException;
 import com.manthan.seat_reservation.service.ShowNotFoundException;
 
@@ -39,6 +42,21 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(ForbiddenException.class)
 	ResponseEntity<ErrorResponse> forbidden(ForbiddenException e) {
 		return ResponseEntity.status(HttpStatus.FORBIDDEN).body(body("forbidden", e.getMessage()));
+	}
+
+	@ExceptionHandler(SeatTakenException.class)
+	ResponseEntity<ErrorResponse> seatTaken(SeatTakenException e) {
+		return ResponseEntity.status(HttpStatus.CONFLICT).body(body("seat-taken", e.getMessage()));
+	}
+
+	@ExceptionHandler(PerUserLimitException.class)
+	ResponseEntity<ErrorResponse> perUserLimit(PerUserLimitException e) {
+		return ResponseEntity.status(HttpStatus.CONFLICT).body(body("per-user-limit", e.getMessage()));
+	}
+
+	@ExceptionHandler(IdempotencyConflictException.class)
+	ResponseEntity<ErrorResponse> idempotencyConflict(IdempotencyConflictException e) {
+		return ResponseEntity.status(HttpStatus.CONFLICT).body(body("idempotency-conflict", e.getMessage()));
 	}
 
 	@ExceptionHandler(ShowNotFoundException.class)

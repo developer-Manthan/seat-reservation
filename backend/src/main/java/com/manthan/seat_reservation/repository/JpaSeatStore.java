@@ -55,6 +55,12 @@ class JpaSeatStore implements SeatStore {
 
 	@Override
 	public void ensureUserShowCount(String userId, long showId) {
+		// A plain read first: a duplicate INSERT IGNORE takes a shared lock on the existing row, and two requests from
+		// the same user that both hold it and then wait for the exclusive UPDATE lock would deadlock each other.
+		// The INSERT IGNORE below stays the real guard for the first booking.
+		if (repository.findUserShowCount(userId, showId).isPresent()) {
+			return;
+		}
 		if (repository.insertUserShowCountIfAbsent(userId, showId) == 0
 				&& repository.findUserShowCount(userId, showId).isEmpty()) {
 			throw new DataInvariantException(
