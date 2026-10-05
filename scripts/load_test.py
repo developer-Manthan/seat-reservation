@@ -14,12 +14,14 @@ Useful options:
 
     python scripts/load_test.py --users 500              # more concurrent users per scenario
     python scripts/load_test.py --only hot-seat overlap  # run some scenarios only
+    python scripts/load_test.py --only storm             # the big one: 20,000 requests at one show with 200 seats
     python scripts/load_test.py --base-url https://your-app.up.railway.app --admin-token "$ADMIN_TOKEN" --no-reconcile
 
 Each run creates its own shows (named load-...), so it can be repeated. The shows stay in the database afterwards,
 because the API has no delete endpoint. The exit code is 0 only if every check passed.
 """
 import argparse
+import http.client
 import json
 import os
 import random
@@ -28,13 +30,14 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+# The five quick scenarios run by default. "storm" is the big one and runs only when asked for (--only storm).
 SCENARIOS = ["hot-seat", "same-key", "overlap", "user-limit", "cancel-rebook"]
+STORM = "storm"
 
 
 class Api:
@@ -42,30 +45,78 @@ class Api:
         self.base_url = base_url.rstrip("/")
         self.admin_token = admin_token
         self.timeout = timeout
+        parts = urllib.parse.urlsplit(self.base_url)
+        self._https = parts.scheme == "https"
+        self._host = parts.hostname
+        self._port = parts.port or (443 if self._https else 80)
+        self._prefix = parts.path.rstrip("/")
+        self._local = threading.local()
+        self.seen = Counter()
+        self._seen_lock = threading.Lock()
+
+    def _connection(self, fresh=False):
+        """One keep-alive connection per thread, so thousands of requests do not open thousands of sockets."""
+        connection = getattr(self._local, "connection", None)
+        if fresh and connection is not None:
+            connection.close()
+            connection = None
+        if connection is None:
+            factory = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
+            connection = factory(self._host, self._port, timeout=self.timeout)
+            self._local.connection = connection
+        return connection
+
+    def observe(self, method, path, status, answer):
+        """Remembers the outcome of every reserve and cancel request, to compare with the server's counters at the end."""
+        kind = "reserve" if path.endswith("/reserve") else "cancel" if path.endswith("/cancel") else None
+        if method != "POST" or kind is None:
+            if status == 429:
+                with self._seen_lock:
+                    self.seen["429"] += 1
+            return
+        error = answer.get("error") if isinstance(answer, dict) else None
+        with self._seen_lock:
+            if status == 0:
+                self.seen["unanswered"] += 1
+            elif status == 429:
+                self.seen["429"] += 1
+            elif status in (200, 201):
+                self.seen[f"{kind} {status}"] += 1
+            else:
+                self.seen[f"{kind} {status} {error}"] += 1
 
     def call(self, method, path, token=None, body=None, trace_id=None):
-        """Returns (status, parsed JSON or text, seconds). Never raises for an HTTP error status."""
+        """Returns (status, parsed JSON or text, seconds). Never raises. Status 0 means the request itself failed."""
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = "Bearer " + token
         if trace_id:
             headers["X-Trace-Id"] = trace_id
         data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(self.base_url + path, data=data, headers=headers, method=method)
         started = time.perf_counter()
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        # The server closes idle keep-alive connections. If a reused connection turns out to be dead before any
+        # answer arrived, try once more on a new one.
+        for attempt in (1, 2):
+            reused = getattr(self._local, "connection", None) is not None
+            connection = self._connection()
+            try:
+                connection.request(method, self._prefix + path, body=data, headers=headers)
+                response = connection.getresponse()
                 status, raw = response.status, response.read()
-        except urllib.error.HTTPError as error:
-            status, raw = error.code, error.read()
-        except Exception as error:  # connection refused, timeout, ...
-            return 0, {"error": "client-error", "message": str(error)}, time.perf_counter() - started
+                break
+            except (http.client.HTTPException, OSError) as error:
+                self._connection(fresh=True)
+                if attempt == 2 or not reused:
+                    self.observe(method, path, 0, None)
+                    return 0, {"error": "client-error", "message": f"{type(error).__name__}: {error}"}, time.perf_counter() - started
         elapsed = time.perf_counter() - started
         text = raw.decode("utf-8", "replace")
         try:
-            return status, json.loads(text), elapsed
+            answer = json.loads(text)
         except ValueError:
-            return status, text, elapsed
+            answer = text
+        self.observe(method, path, status, answer)
+        return status, answer, elapsed
 
     def token_for(self, user_id):
         status, body, _ = self.call("POST", "/auth/token", body={"user_id": user_id})
@@ -86,6 +137,12 @@ class Api:
             raise SystemExit(f"Could not read show {show_id}: {status} {body}")
         return body
 
+    def reservations(self, token, show_id):
+        status, body, _ = self.call("GET", f"/reservations?show_id={show_id}", token=token)
+        if status != 200:
+            raise SystemExit(f"Could not read reservations: {status} {body}")
+        return body
+
     def metrics(self):
         """The Prometheus text as {series: value}, or None if the endpoint cannot be read."""
         status, body, _ = self.call("GET", "/actuator/prometheus", token=self.admin_token)
@@ -100,6 +157,128 @@ class Api:
                 except ValueError:
                     pass
         return values
+
+
+def _raise_open_file_limit(needed):
+    """Every open connection is an open file. Raise this process's limit if the system allows it."""
+    try:
+        import resource
+    except ImportError:          # Windows has no such limit to raise
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft >= needed:
+        return
+    target = needed if hard == resource.RLIM_INFINITY else min(needed, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError):
+        target = soft
+    if target < needed:
+        raise SystemExit(f"This run needs about {needed} open connections but the system allows {target}. "
+                         f"Raise it first with: ulimit -n {needed}   (or pass a smaller --concurrency)")
+
+
+def _parse_response(raw):
+    """Splits a raw HTTP/1.1 response read to the end of the connection into (status, body bytes)."""
+    head, _, rest = raw.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for line in lines[1:]:
+        key, _, value = line.partition(b":")
+        headers[key.strip().lower()] = value.strip().lower()
+    if b"chunked" in headers.get(b"transfer-encoding", b""):
+        body, position = b"", 0
+        while True:
+            end = rest.find(b"\r\n", position)
+            if end < 0:
+                break
+            size = int(rest[position:end].split(b";")[0] or b"0", 16)
+            if size == 0:
+                break
+            body += rest[end + 2:end + 2 + size]
+            position = end + 2 + size + 2
+        return status, body
+    return status, rest
+
+
+def fire(api, jobs, concurrency, timeout):
+    """
+    Sends every job (method, path, token, body) and returns (status, answer, seconds) for each, in order.
+    concurrency 0 means all at once: every request is started in the same instant, each on its own connection, and is
+    sent the moment its connection opens. A number above 0 keeps at most that many requests in flight instead.
+    Also reports how many requests were in flight together at the peak. Standard library only (asyncio).
+    """
+    import asyncio
+    import socket
+    import ssl
+
+    at_once = concurrency <= 0
+    _raise_open_file_limit((len(jobs) if at_once else concurrency) + 200)
+    context = ssl.create_default_context() if api._https else None
+    # Look the address up once, not 20,000 times, and prefer IPv4 (Docker forwards localhost over IPv4).
+    infos = socket.getaddrinfo(api._host, api._port, type=socket.SOCK_STREAM)
+    address = sorted(infos, key=lambda info: info[0] != socket.AF_INET)[0][4][0]
+    results = [None] * len(jobs)
+    stats = {"in_flight": 0, "peak_in_flight": 0, "connected": 0, "last_sent_after": 0.0}
+
+    def request_bytes(method, path, token, body):
+        data = json.dumps(body).encode() if body is not None else b""
+        head = (f"{method} {api._prefix}{path} HTTP/1.1\r\nHost: {api._host}\r\nContent-Type: application/json\r\n"
+                f"Authorization: Bearer {token}\r\nContent-Length: {len(data)}\r\nConnection: close\r\n\r\n")
+        return head.encode() + data
+
+    async def run():
+        limit = asyncio.Semaphore(concurrency) if not at_once else None
+        # A few thousand connection attempts at a time, so the listen queue of the server is not flooded with
+        # attempts it would only make the client repeat. Every request is still started at the same moment.
+        opening = asyncio.Semaphore(2000)
+        began = time.perf_counter()
+
+        async def one(index, job):
+            payload = request_bytes(*job)
+            writer = None
+            counted = False
+            started = time.perf_counter()
+            try:
+                if limit:
+                    await limit.acquire()
+                    started = time.perf_counter()
+                async with opening:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(address, api._port, ssl=context, server_hostname=api._host if context else None), 120)
+                stats["connected"] += 1
+                writer.write(payload)
+                await writer.drain()
+                stats["in_flight"] += 1
+                counted = True
+                stats["peak_in_flight"] = max(stats["peak_in_flight"], stats["in_flight"])
+                stats["last_sent_after"] = max(stats["last_sent_after"], time.perf_counter() - began)
+                raw = await asyncio.wait_for(reader.read(), timeout)
+                status, body = _parse_response(raw)
+                text = body.decode("utf-8", "replace")
+                try:
+                    answer = json.loads(text)
+                except ValueError:
+                    answer = text
+                results[index] = (status, answer, time.perf_counter() - started)
+                api.observe(job[0], job[1], status, answer)
+            except Exception as error:
+                results[index] = (0, {"error": "client-error", "message": f"{type(error).__name__}: {error}"}, time.perf_counter() - started)
+                api.observe(job[0], job[1], 0, None)
+            finally:
+                if counted:
+                    stats["in_flight"] -= 1
+                if limit:
+                    limit.release()
+                if writer is not None:
+                    writer.close()
+
+        stats["fired_at"] = time.perf_counter()
+        await asyncio.gather(*[one(i, job) for i, job in enumerate(jobs)])
+
+    asyncio.run(run())
+    return results, stats
 
 
 def run_together(tasks):
@@ -265,6 +444,213 @@ def scenario_cancel_rebook(api, report, args, tag):
     check_show(api, report, name, show, rebooked)
 
 
+def scenario_storm(api, report, args, tag):
+    """
+    One fresh show with 200 seats and limit 4, hit by about --requests requests at once, all mixed together:
+      hot      many users each want one of a handful of hot seats (some send the same request three times)
+      retry    a user sends the same request (same key) ten times
+      conflict a user sends two different requests under the same key
+      limit    a user fires ten bookings at once on a show that allows four
+      spoof    a user books while claiming to be someone else in the body
+      attack   a user tries to cancel a reservation that belongs to someone else
+    While it runs, a checker keeps reading the show and adding up the seat counts.
+    """
+    seat_count, per_user_limit = 200, 4
+    seats = [f"S{i}" for i in range(1, seat_count + 1)]
+    name = f"storm: {args.requests} requests, one show, {seat_count} seats, " + (
+        "all at once" if args.concurrency <= 0 else f"{args.concurrency} in flight at a time")
+    show = api.create_show(f"load-storm-{tag}", seats, per_user_limit=per_user_limit)
+    rng = random.Random(7)
+    cursor = [0]
+
+    def take(n):
+        chunk = seats[cursor[0]:cursor[0] + n]
+        cursor[0] += n
+        return chunk
+
+    hot_seats = take(args.hot_seats)
+    users = []          # user ids, the token is fetched before the storm
+    plan = []           # (group, user, method, path, body)
+
+    def new_user():
+        users.append(str(uuid.uuid4()))
+        return users[-1]
+
+    def reserve(group, user, wanted, key, extra=None):
+        body = {"seats": wanted, "idempotency_key": key}
+        body.update(extra or {})
+        plan.append((group, user, "POST", f"/shows/{show}/reserve", body))
+
+    # retry: 40 users, each sends the same request 10 times
+    retry_users = {new_user(): seat for seat in take(40)}
+    for user, seat in retry_users.items():
+        for _ in range(10):
+            reserve("retry", user, [seat], "retry")
+
+    # conflict: 20 users, each sends seat a five times and seat b five times under ONE key
+    conflict_users = {new_user(): take(2) for _ in range(20)}
+    for user, (a, b) in conflict_users.items():
+        for _ in range(5):
+            reserve("conflict", user, [a], "one-key")
+            reserve("conflict", user, [b], "one-key")
+
+    # limit: 10 users, each fires 10 single-seat bookings (different keys) on a limit of 4
+    limit_users = {new_user(): take(10) for _ in range(10)}
+    for user, own in limit_users.items():
+        for i, seat in enumerate(own):
+            reserve("limit", user, [seat], f"limit-{i}")
+
+    # spoof and attack: 5 victims already hold a seat. 5 attackers book while naming the victim in the body, and
+    # try to cancel the reservation of the victim 20 times.
+    victims = {new_user(): seat for seat in take(5)}
+    attackers = {new_user(): seat for seat in take(5)}
+
+    # hot: everything else. Every tenth user sends the same request three times.
+    hot_users = defaultdict(list)
+    remaining = args.requests - len(plan) - len(attackers) * 21
+    i = 0
+    while remaining > 0:
+        seat = hot_seats[i % len(hot_seats)]
+        user = new_user()
+        hot_users[seat].append(user)
+        copies = min(remaining, 3 if i % 10 == 0 else 1)
+        for _ in range(copies):
+            reserve("hot", user, [seat], "hot")
+        remaining -= copies
+        i += 1
+
+    print(f"\n== {name}")
+    print(f"   setting up {len(users)} users ...", flush=True)
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        tokens = dict(zip(users, pool.map(api.token_for, users)))
+
+    victim_reservations = {}
+    for victim, seat in victims.items():
+        status, body, _ = api.call("POST", f"/shows/{show}/reserve", token=tokens[victim], body={"seats": [seat], "idempotency_key": "victim"})
+        if status != 201:
+            raise SystemExit(f"Setup failed, the victim could not book {seat}: {status} {body}")
+        victim_reservations[victim] = body["reservation_id"]
+    for (attacker, seat), (victim, reservation) in zip(attackers.items(), victim_reservations.items()):
+        reserve("spoof", attacker, [seat], "spoof", {"user_id": victim})
+        for _ in range(20):
+            plan.append(("attack", attacker, "POST", f"/reservations/{reservation}/cancel", {"user_id": victim}))
+
+    rng.shuffle(plan)
+
+    # The checker: reads the show the whole time and adds up the counts.
+    stop = threading.Event()
+    samples, broken = [0], []
+
+    def watch():
+        while not stop.is_set():
+            status, view, _ = api.call("GET", f"/shows/{show}", token=api.admin_token)
+            if status == 200:
+                counts = view["counts"]
+                samples[0] += 1
+                if counts["available"] + counts["held"] + counts["confirmed"] != view["total_seats"] or len(view["seats"]) != seat_count:
+                    broken.append(counts)
+            stop.wait(0.2)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+
+    how = "all at once" if args.concurrency <= 0 else f"{args.concurrency} in flight at a time"
+    print(f"   firing {len(plan)} requests, {how} ...", flush=True)
+    jobs = [(method, path, tokens[user], body) for (_, user, method, path, body) in plan]
+    results, stats = fire(api, jobs, args.concurrency, max(args.timeout, 600))
+    seconds = time.perf_counter() - stats["fired_at"]
+    stop.set()
+    watcher.join(timeout=30)
+    print(f"   {stats['connected']} of {len(plan)} connections opened, the last request was sent {stats['last_sent_after']:.1f}s after the first, "
+          f"and at the peak {stats['peak_in_flight']} requests were in flight together")
+    failures = Counter(a.get("message", "?").split(":")[0] for s_, a, _ in results if s_ == 0 and isinstance(a, dict))
+    if failures:
+        print(f"   requests that got no answer, by cause: {dict(failures.most_common(5))}")
+
+    statuses = report.scenario(name, results, seconds)
+    by_group = defaultdict(Counter)
+    by_user = defaultdict(list)
+    for (group, user, _, _, body), (status, answer, _) in zip(plan, results):
+        by_group[group][status] += 1
+        by_user[(group, user)].append((status, answer, body))
+    for group in ("hot", "retry", "conflict", "limit", "spoof", "attack"):
+        print(f"   {group:9s} {sum(by_group[group].values()):6d} requests  {dict(sorted(by_group[group].items()))}")
+
+    def error_of(answer):
+        return answer.get("error") if isinstance(answer, dict) else None
+
+    # 2. zero 5xx is checked by report.scenario above. A 429 is not a 5xx, but the brief wants 409s, so flag it.
+    report.check(name, "no 429 (every refusal is a clean 409 or 404)", not statuses.get(429), f"{statuses.get(429, 0)} request(s) got 429")
+
+    # 1. each hot seat: exactly one winner, everyone else 409 seat-taken
+    seat_owners = defaultdict(set)
+    for (status, answer, _) in results:
+        if status == 201 and isinstance(answer, dict):
+            for seat in answer.get("seats", []):
+                seat_owners[seat].add(answer["reservation_id"])
+    report.check(name, "no seat is held by two reservations", all(len(ids) == 1 for ids in seat_owners.values()),
+                 str({s: len(i) for s, i in seat_owners.items() if len(i) > 1}))
+    for seat in hot_seats:
+        winners = [u for u in hot_users[seat] if any(s == 201 for s, _, _ in by_user[("hot", u)])]
+        losers_clean = all(s == 409 and error_of(a) == "seat-taken"
+                           for u in hot_users[seat] if u not in winners for s, a, _ in by_user[("hot", u)])
+        winner_consistent = all(s == 201 for u in winners for s, _, _ in by_user[("hot", u)])
+        report.check(name, f"hot seat {seat}: exactly one of {len(hot_users[seat])} users won it",
+                     len(winners) == 1 and len(seat_owners[seat]) == 1, f"{len(winners)} winner(s), {len(seat_owners[seat])} reservation(s)")
+        report.check(name, f"hot seat {seat}: every other user got 409 seat-taken", losers_clean and winner_consistent)
+
+    # 4. idempotency
+    retry_ok = all(all(s == 201 for s, _, _ in by_user[("retry", u)]) and len({a["reservation_id"] for _, a, _ in by_user[("retry", u)]}) == 1
+                   for u in retry_users)
+    report.check(name, "retry: every copy of the same request got 201 with one and the same reservation", retry_ok)
+    conflict_ok, conflict_refused = True, 0
+    for user in conflict_users:
+        answers = by_user[("conflict", user)]
+        ids = {a["reservation_id"] for s, a, _ in answers if s == 201}
+        refused = [a for s, a, _ in answers if s != 201]
+        conflict_refused += len(refused)
+        mine = [r for r in api.reservations(tokens[user], show) if r["status"] == "confirmed"]
+        if len(ids) != 1 or len(refused) != 5 or any(error_of(a) != "idempotency-conflict" for a in refused) \
+                or len(mine) != 1 or len(mine[0]["seats"]) != 1:
+            conflict_ok = False
+    report.check(name, f"conflict: one key, two different requests: one reservation, the other request refused ({conflict_refused} x 409 idempotency-conflict)",
+                 conflict_ok)
+
+    # 5. per-user limit
+    limit_ok = True
+    for user in limit_users:
+        answers = by_user[("limit", user)]
+        booked = sum(1 for s, _, _ in answers if s == 201)
+        refused_ok = all(s == 409 and error_of(a) == "per-user-limit" for s, a, _ in answers if s != 201)
+        held = sum(len(r["seats"]) for r in api.reservations(tokens[user], show) if r["status"] == "confirmed")
+        if booked != per_user_limit or held != per_user_limit or not refused_ok:
+            limit_ok = False
+    report.check(name, f"limit: each user who fired 10 bookings holds exactly {per_user_limit}, the rest got 409 per-user-limit", limit_ok)
+
+    # 6. identity comes from the token
+    spoof_ok, attack_ok = True, True
+    for (attacker, seat), (victim, reservation) in zip(attackers.items(), victim_reservations.items()):
+        attacker_seats = {s for r in api.reservations(tokens[attacker], show) if r["status"] == "confirmed" for s in r["seats"]}
+        victim_now = api.reservations(tokens[victim], show)
+        victim_seats = {s for r in victim_now if r["status"] == "confirmed" for s in r["seats"]}
+        if seat not in attacker_seats or seat in victim_seats:
+            spoof_ok = False
+        if victim_seats != {victims[victim]} or any(r["reservation_id"] == reservation and r["status"] != "confirmed" for r in victim_now):
+            attack_ok = False
+        if any(s != 404 for s, _, _ in by_user[("attack", attacker)]):
+            attack_ok = False
+    report.check(name, "spoof: a booking that names another user in the body belongs to the user of the token", spoof_ok)
+    report.check(name, "attack: nobody could cancel a reservation of another user (all 404), the victims still hold their seats", attack_ok)
+
+    # 3. the invariant, during and after
+    report.check(name, f"available + held + confirmed == total_seats in all {samples[0]} reads taken during the storm",
+                 samples[0] > 0 and not broken, f"{len(broken)} bad read(s), {samples[0]} read(s)")
+    expected = len(seat_owners) + len(victims)
+    view = check_show(api, report, name, show, expected)
+    confirmed = {seat["seat_label"] for seat in view["seats"] if seat["status"] == "confirmed"}
+    report.check(name, "the confirmed seats are exactly the seats the responses reported", confirmed == set(seat_owners) | set(victims.values()))
+
+
 def compare_metrics(api, report, before, show_checks):
     after = api.metrics()
     print("\n== metrics (from /actuator/prometheus)")
@@ -275,6 +661,31 @@ def compare_metrics(api, report, before, show_checks):
         delta = after[series] - before.get(series, 0)
         if delta:
             print(f"   {series:60s} +{delta:.0f}")
+    def grew(series):
+        return int(after.get(series, 0) - before.get(series, 0))
+
+    def declined(reason):
+        return grew(f'reservations_declined_total{{reason="{reason}"}}')
+
+    # The counters must have grown by exactly what this run saw in its own responses. A first booking and a replay
+    # both answer 201, so those two counters are compared together. Other clients using the app during the run, or a
+    # request that got no answer (the server may still have processed it), make this comparison meaningless.
+    seen = api.seen
+    if seen["unanswered"]:
+        print(f"   counters not compared with the responses: {seen['unanswered']} request(s) got no answer")
+    else:
+        pairs = [
+            ("confirmed + idempotent-replay", grew("reservations_confirmed_total") + declined("idempotent-replay"), "201 answers to reserve", seen["reserve 201"]),
+            ("declined{seat-taken}", declined("seat-taken"), "409 seat-taken answers", seen["reserve 409 seat-taken"]),
+            ("declined{per-user-limit}", declined("per-user-limit"), "409 per-user-limit answers", seen["reserve 409 per-user-limit"]),
+            ("declined{idempotency-conflict}", declined("idempotency-conflict"), "409 idempotency-conflict answers", seen["reserve 409 idempotency-conflict"]),
+            ("cancelled", grew("reservations_cancelled_total"), "200 answers to cancel", seen["cancel 200"]),
+            ("requests_throttled", grew("requests_throttled_total"), "429 answers", seen["429"]),
+        ]
+        for metric, counted, what, observed in pairs:
+            report.check("metrics", f"{metric} grew by {counted} == {observed} {what} seen by this run", counted == observed,
+                         f"the counter grew by {counted}, this run saw {observed}")
+
     for show_id in show_checks:
         view = api.show(show_id)
         gauge = after.get(f'seats_available{{show_id="{show_id}"}}')
@@ -311,7 +722,11 @@ def main():
     parser.add_argument("--users", type=int, default=300, help="concurrent users per scenario (default 300)")
     parser.add_argument("--seats", type=int, default=60, help="seats in the overlap scenario (default 60)")
     parser.add_argument("--timeout", type=float, default=90, help="seconds to wait for one response (default 90)")
-    parser.add_argument("--only", nargs="+", choices=SCENARIOS, help="run only these scenarios")
+    parser.add_argument("--only", nargs="+", choices=SCENARIOS + [STORM], help="run only these scenarios (storm runs only when named here)")
+    parser.add_argument("--requests", type=int, default=20000, help="storm: total requests (default 20000)")
+    parser.add_argument("--concurrency", type=int, default=0,
+                        help="storm: 0 (default) sends every request at once, a number keeps at most that many in flight")
+    parser.add_argument("--hot-seats", type=int, default=5, help="storm: number of hot seats (default 5)")
     parser.add_argument("--no-reconcile", action="store_true", help="skip the database reconciliation (for a remote app)")
     parser.add_argument("--reconcile-command", default="docker compose exec -T mysql mysql -N -useat -pdev-only-password seat_reservation",
                         help="command that reads SQL on stdin and runs it against the app's database")
@@ -327,7 +742,7 @@ def main():
     before = api.metrics()
     print(f"Load test against {args.base_url}, {args.users} users per scenario, run {tag}")
     runners = {"hot-seat": scenario_hot_seat, "same-key": scenario_same_key, "overlap": scenario_overlap,
-               "user-limit": scenario_user_limit, "cancel-rebook": scenario_cancel_rebook}
+               "user-limit": scenario_user_limit, "cancel-rebook": scenario_cancel_rebook, STORM: scenario_storm}
     started = time.perf_counter()
     for scenario in args.only or SCENARIOS:
         runners[scenario](api, report, args, tag)
