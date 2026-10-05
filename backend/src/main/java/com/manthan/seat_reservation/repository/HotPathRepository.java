@@ -1,5 +1,6 @@
 package com.manthan.seat_reservation.repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -30,6 +31,16 @@ public interface HotPathRepository extends Repository<Seat, SeatId> {
 	@Query("UPDATE Seat s SET s.status = :confirmed "
 			+ "WHERE s.showId = :showId AND s.seatLabel = :seatLabel AND s.status = :available")
 	int claimSeat(@Param("showId") Long showId, @Param("seatLabel") String seatLabel,
+			@Param("available") SeatStatus available, @Param("confirmed") SeatStatus confirmed);
+
+	/**
+	 * All seats of an all_or_nothing request in one statement. The caller compares the rows affected with the number of
+	 * seats asked for: equal means every seat was won, anything less means at least one was not available.
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("UPDATE Seat s SET s.status = :confirmed "
+			+ "WHERE s.showId = :showId AND s.seatLabel IN :seatLabels AND s.status = :available")
+	int claimSeats(@Param("showId") Long showId, @Param("seatLabels") Collection<String> seatLabels,
 			@Param("available") SeatStatus available, @Param("confirmed") SeatStatus confirmed);
 
 	@Modifying(flushAutomatically = true, clearAutomatically = true)
@@ -93,6 +104,14 @@ public interface HotPathRepository extends Repository<Seat, SeatId> {
 	int insertReservationSeat(@Param("showId") Long showId, @Param("seatLabel") String seatLabel,
 			@Param("reservationId") String reservationId);
 
+	/** The same plain INSERT for several seats at once: one row per seat row of the show that is in the list. */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query(value = "INSERT INTO reservation_seats (show_id, seat_label, reservation_id) "
+			+ "SELECT s.show_id, s.seat_label, :reservationId FROM seats s "
+			+ "WHERE s.show_id = :showId AND s.seat_label IN (:seatLabels)", nativeQuery = true)
+	int insertReservationSeats(@Param("showId") Long showId, @Param("seatLabels") Collection<String> seatLabels,
+			@Param("reservationId") String reservationId);
+
 	// ---- delete ----
 
 	@Modifying(flushAutomatically = true, clearAutomatically = true)
@@ -112,6 +131,12 @@ public interface HotPathRepository extends Repository<Seat, SeatId> {
 
 	@Query("SELECT r FROM Reservation r WHERE r.id = :id")
 	Optional<Reservation> findReservation(@Param("id") String id);
+
+	/** Which of these seats are available right now. Used only to refuse early, the guarded update still decides. */
+	@Query("SELECT s.seatLabel FROM Seat s "
+			+ "WHERE s.showId = :showId AND s.seatLabel IN :seatLabels AND s.status = :available")
+	List<String> findAvailableSeatLabels(@Param("showId") Long showId, @Param("seatLabels") Collection<String> seatLabels,
+			@Param("available") SeatStatus available);
 
 	@Query("SELECT rs.seatLabel FROM ReservationSeat rs WHERE rs.reservationId = :reservationId "
 			+ "ORDER BY rs.seatLabel")

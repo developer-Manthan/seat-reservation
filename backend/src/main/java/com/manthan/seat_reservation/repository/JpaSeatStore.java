@@ -1,7 +1,9 @@
 package com.manthan.seat_reservation.repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 import org.springframework.stereotype.Repository;
 
@@ -79,13 +81,28 @@ class JpaSeatStore implements SeatStore {
 	}
 
 	@Override
+	public Set<String> findAvailableSeatLabels(long showId, Collection<String> seatLabels) {
+		return Set.copyOf(repository.findAvailableSeatLabels(showId, seatLabels, SeatStatus.available));
+	}
+
+	@Override
 	public boolean claimSeat(long showId, String seatLabel) {
 		return repository.claimSeat(showId, seatLabel, SeatStatus.available, SeatStatus.confirmed) == 1;
 	}
 
 	@Override
+	public int claimSeats(long showId, Collection<String> seatLabels) {
+		return repository.claimSeats(showId, seatLabels, SeatStatus.available, SeatStatus.confirmed);
+	}
+
+	@Override
 	public void insertReservationSeat(long showId, String seatLabel, String reservationId) {
 		repository.insertReservationSeat(showId, seatLabel, reservationId);
+	}
+
+	@Override
+	public int insertReservationSeats(long showId, Collection<String> seatLabels, String reservationId) {
+		return repository.insertReservationSeats(showId, seatLabels, reservationId);
 	}
 
 	@Override

@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
 
@@ -31,8 +32,8 @@ import com.manthan.seat_reservation.service.ReserveTransaction.KeyExists;
 import com.manthan.seat_reservation.service.ReserveTransaction.Outcome;
 
 /**
- * Orchestrates a reserve request. This bean is NOT transactional: it validates, reads the show, takes the idempotency
- * fast path, calls the transactional {@link ReserveTransaction} (a separate bean, so a retry loop can wrap that call
+ * Orchestrates a reserve request. This bean is NOT transactional: it validates, reads the show, takes the fast path
+ * (replay, or an early refusal of seats that are not free), calls the transactional {@link ReserveTransaction} (a separate bean, so a retry loop can wrap that call
  * later), and turns the outcome into a result. Metrics are recorded here, after the transaction has ended.
  */
 @Service
@@ -85,7 +86,10 @@ public class ReservationService {
 		}
 		String requestHash = requestHash(showId, mode, seats);
 
-		// 0. Fast path (outside any transaction). Only an optimization, the primary key is the real guard.
+		// 0. Fast path (outside any transaction): two plain reads, only an optimization. The seats are read BEFORE the
+		// key. A booking writes its seats and its key in one transaction, so if the seat read already sees a copy of
+		// this request as booked, the key read after it sees that copy's key and the answer is a replay, not a 409.
+		Set<String> free = store.findAvailableSeatLabels(showId, seats);
 		Optional<IdempotencyKey> existing = store.findIdempotencyKey(userId, idempotencyKey);
 		if (existing.isPresent()) {
 			return replay(userId, existing.get().getRequestHash(), existing.get().getReservationId(), requestHash, seats, mode);
@@ -93,6 +97,15 @@ public class ReservationService {
 
 		Outcome outcome;
 		try {
+			// Refuse without writing anything when the request cannot succeed. This read never grants a seat: a seat
+			// that looks free here is still decided by the guarded update inside the transaction.
+			List<String> notFree = seats.stream().filter(label -> !free.contains(label)).toList();
+			if (mode == ReservationMode.all_or_nothing && !notFree.isEmpty()) {
+				throw new SeatTakenException(List.of(notFree.get(0)));
+			}
+			if (free.isEmpty()) {
+				throw new SeatTakenException(notFree);
+			}
 			Attempt attempt = new Attempt(userId, showId, show.getPricePaise(), show.getPerUserLimit(), seats, idempotencyKey,
 					requestHash, mode);
 			// The retry loop wraps the transactional call from outside, so every attempt is a fresh transaction.

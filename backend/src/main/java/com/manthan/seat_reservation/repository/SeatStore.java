@@ -1,7 +1,9 @@
 package com.manthan.seat_reservation.repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 import com.manthan.seat_reservation.domain.IdempotencyKey;
 import com.manthan.seat_reservation.domain.Reservation;
@@ -37,11 +39,26 @@ public interface SeatStore {
 	/** Gives k back, only if held_count is at least k. */
 	boolean decrementUserCount(String userId, long showId, int k);
 
+	/**
+	 * Which of these seats are available right now: a plain read, outside any transaction. It may only be used to
+	 * refuse a request early, never to grant a seat. Granting is {@link #claimSeat} alone.
+	 */
+	Set<String> findAvailableSeatLabels(long showId, Collection<String> seatLabels);
+
 	/** Guarded available to confirmed. True means this request won the seat. */
 	boolean claimSeat(long showId, String seatLabel);
 
+	/**
+	 * Guarded available to confirmed for several seats in one statement. Returns how many were won. The caller must
+	 * compare it with the number asked for and roll back when it is less.
+	 */
+	int claimSeats(long showId, Collection<String> seatLabels);
+
 	/** Plain INSERT. A duplicate key throws DataIntegrityViolationException (the guard logic is broken). */
 	void insertReservationSeat(long showId, String seatLabel, String reservationId);
+
+	/** The same plain INSERT for several seats in one statement. Returns the rows inserted. */
+	int insertReservationSeats(long showId, Collection<String> seatLabels, String reservationId);
 
 	/** Guarded pending to confirmed with the real amount. */
 	boolean confirmReservation(String reservationId, long amountPaise);

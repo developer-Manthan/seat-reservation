@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.List;
 import java.util.UUID;
 
 import org.junit.jupiter.api.Test;
@@ -51,6 +52,48 @@ class SeatStoreTest {
 		assertThat(store.claimSeat(showId, "A2")).isFalse();
 		assertThat(store.claimSeat(showId, "NOPE")).isFalse();
 		assertThat(seatStatus(showId, "A1")).isEqualTo("held");
+	}
+
+	@Test
+	void claimSeatsWinsEverySeatOnceThenNone() {
+		long showId = newShow(4, "A1", "A2", "A3");
+
+		assertThat(store.claimSeats(showId, List.of("A1", "A2", "A3"))).isEqualTo(3);
+		assertThat(store.claimSeats(showId, List.of("A1", "A2", "A3"))).isZero();
+		assertThat(seatStatus(showId, "A2")).isEqualTo("confirmed");
+	}
+
+	@Test
+	void claimSeatsReportsFewerRowsWhenASeatIsTakenOrUnknown() {
+		long showId = newShow(4, "A1", "A2", "A3");
+		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ? AND seat_label = 'A2'", showId);
+
+		// The caller sees 2 of 3 and must roll back. Only the guard decides which rows change.
+		assertThat(store.claimSeats(showId, List.of("A1", "A2", "A3"))).isEqualTo(2);
+		assertThat(store.claimSeats(showId, List.of("NOPE"))).isZero();
+		assertThat(seatStatus(showId, "A1")).isEqualTo("confirmed");
+		assertThat(seatStatus(showId, "A3")).isEqualTo("confirmed");
+	}
+
+	@Test
+	void findAvailableSeatLabelsReturnsOnlyTheFreeOnesAskedFor() {
+		long showId = newShow(4, "A1", "A2", "A3");
+		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ? AND seat_label = 'A2'", showId);
+
+		assertThat(store.findAvailableSeatLabels(showId, List.of("A1", "A2", "NOPE"))).containsExactly("A1");
+	}
+
+	@Test
+	void insertReservationSeatsWritesOneRowPerSeatAndThePrimaryKeyStillRejectsASecondOwner() {
+		String user = newUser();
+		long showId = newShow(4, "A1", "A2", "A3");
+		String first = newReservation(user, showId, "confirmed");
+		String second = newReservation(user, showId, "confirmed");
+
+		assertThat(store.insertReservationSeats(showId, List.of("A1", "A3"), first)).isEqualTo(2);
+		assertThat(store.findSeatLabels(first)).containsExactly("A1", "A3");
+		assertThatThrownBy(() -> store.insertReservationSeats(showId, List.of("A2", "A3"), second))
+				.isInstanceOf(DataIntegrityViolationException.class);
 	}
 
 	@Test

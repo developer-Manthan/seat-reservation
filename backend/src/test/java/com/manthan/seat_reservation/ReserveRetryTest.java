@@ -31,6 +31,7 @@ import org.springframework.test.web.servlet.ResultActions;
 
 import com.manthan.seat_reservation.auth.TokenService;
 import com.manthan.seat_reservation.service.ReserveTransaction;
+import com.manthan.seat_reservation.service.SeatTakenException;
 
 import io.micrometer.core.instrument.MeterRegistry;
 
@@ -165,8 +166,9 @@ class ReserveRetryTest {
 	@Test
 	void aDomainDeclineIsNotRetried() throws Exception {
 		long show = newShow("A1");
-		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ?", show);
-		doCallRealMethod().when(reserveTransaction).reserveOnce(any());
+		// The seat looked free in the early read and was lost inside the transaction (a seat already taken before
+		// the request never reaches the transaction at all).
+		doThrow(new SeatTakenException(List.of("A1"))).when(reserveTransaction).reserveOnce(any());
 
 		reserve(newUserAuth(), show, "[\"A1\"]", "k1")
 				.andExpect(status().isConflict())

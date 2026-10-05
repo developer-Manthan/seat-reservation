@@ -72,25 +72,29 @@ public class ReserveTransaction {
 			throw new PerUserLimitException(requested, attempt.perUserLimit());
 		}
 
-		// 5. Seats in sorted order. The guarded update is the atomic decision.
+		// 5. Seats. The guarded update is the atomic decision.
 		List<String> won = new ArrayList<>();
 		List<String> unavailable = new ArrayList<>();
-		for (String label : attempt.seats()) {
-			if (store.claimSeat(attempt.showId(), label)) {
-				log.debug("Seat {} of show {} claimed", label, attempt.showId());
-				insertReservationSeat(attempt, reservationId, label);
-				won.add(label);
-			}
-			else if (attempt.mode() == ReservationMode.all_or_nothing) {
-				throw new SeatTakenException(List.of(label));
-			}
-			else {
-				log.debug("Seat {} of show {} not available", label, attempt.showId());
-				unavailable.add(label);
-			}
+		if (attempt.mode() == ReservationMode.all_or_nothing) {
+			claimAll(attempt, reservationId);
+			won.addAll(attempt.seats());
 		}
-		if (won.isEmpty()) {
-			throw new SeatTakenException(unavailable);
+		else {
+			// best_effort keeps whatever it wins, so it asks seat by seat, in sorted order.
+			for (String label : attempt.seats()) {
+				if (store.claimSeat(attempt.showId(), label)) {
+					log.debug("Seat {} of show {} claimed", label, attempt.showId());
+					insertReservationSeat(attempt, reservationId, label);
+					won.add(label);
+				}
+				else {
+					log.debug("Seat {} of show {} not available", label, attempt.showId());
+					unavailable.add(label);
+				}
+			}
+			if (won.isEmpty()) {
+				throw new SeatTakenException(unavailable);
+			}
 		}
 
 		// 6. best_effort: give the quota for the seats not won back.
@@ -104,6 +108,32 @@ public class ReserveTransaction {
 			throw new DataInvariantException("Reservation " + reservationId + " was not pending at confirm time");
 		}
 		return new Booked(reservationId, List.copyOf(won), List.copyOf(unavailable), amount);
+	}
+
+	/**
+	 * all_or_nothing: every seat in one guarded update. Fewer rows than seats means at least one was not available:
+	 * the exception rolls the others back. The count cannot say which seat it was, so all of them are reported
+	 * (a seat that was already taken before the request is refused earlier, by name, in ReservationService).
+	 */
+	private void claimAll(Attempt attempt, String reservationId) {
+		int requested = attempt.seats().size();
+		int claimed = store.claimSeats(attempt.showId(), attempt.seats());
+		if (claimed != requested) {
+			log.debug("Only {} of {} seats of show {} were available", claimed, requested, attempt.showId());
+			throw new SeatTakenException(attempt.seats());
+		}
+		int inserted;
+		try {
+			inserted = store.insertReservationSeats(attempt.showId(), attempt.seats(), reservationId);
+		}
+		catch (DataIntegrityViolationException e) {
+			log.error("Invariant violation: reservation_seats already has one of show={} seats={} although the guarded update won them",
+					attempt.showId(), attempt.seats(), e);
+			throw new SeatTakenException(attempt.seats());
+		}
+		if (inserted != requested) {
+			throw new DataInvariantException("Claimed " + requested + " seats but inserted " + inserted + " reservation_seats rows");
+		}
 	}
 
 	/**

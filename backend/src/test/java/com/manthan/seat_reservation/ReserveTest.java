@@ -2,8 +2,15 @@ package com.manthan.seat_reservation;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.startsWith;
+import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -12,10 +19,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -573,7 +582,9 @@ class ReserveTest {
 		String user = newUser();
 		String id = reservationId(reserve(user, show, "[\"A1\"]", "k1", null).andExpect(status().isCreated()));
 
-		// Make the fast path see nothing once, so the request goes into the transaction and meets the existing key there.
+		// Two copies racing: this one did both fast-path reads before the first copy committed, so it saw the seat free
+		// and no key. It goes into the transaction and meets the existing key there.
+		doReturn(Set.of("A1")).doCallRealMethod().when(seatStore).findAvailableSeatLabels(anyLong(), anyCollection());
 		doReturn(Optional.empty()).doCallRealMethod().when(seatStore).findIdempotencyKey(anyString(), anyString());
 		reserve(user, show, "[\"A1\"]", "k1", null)
 				.andExpect(status().isCreated())
@@ -600,6 +611,129 @@ class ReserveTest {
 		assertThat(reservations(show)).isEqualTo(1);
 		assertThat(seatStatus(show, "A2")).isEqualTo("available");
 		assertInvariants(show);
+	}
+
+	// ---- early refusal (the fast-path seat read) ----
+
+	@Test
+	void aTakenSeatIsRefusedBeforeAnythingIsWritten() throws Exception {
+		long show = newShow(4, 100, "A1", "A2");
+		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ? AND seat_label = 'A2'", show);
+		String user = newUser();
+		double seatTakenBefore = counter("reservations.declined", "reason", "seat-taken");
+
+		reserve(user, show, "[\"A1\",\"A2\"]", "k1", "all_or_nothing")
+				.andExpect(status().isConflict())
+				.andExpect(jsonPath("$.error").value("seat-taken"))
+				.andExpect(jsonPath("$.message").value("Seat(s) not available: A2"));
+		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ?", show);
+		reserve(user, show, "[\"A1\",\"A2\"]", "k2", "best_effort")
+				.andExpect(status().isConflict())
+				.andExpect(jsonPath("$.error").value("seat-taken"))
+				.andExpect(jsonPath("$.message").value("Seat(s) not available: A1, A2"));
+
+		// No transaction was started: not even the provisional reservation was inserted.
+		verify(seatStore, never()).insertPendingReservation(anyString(), anyLong(), anyString());
+		assertThat(counter("reservations.declined", "reason", "seat-taken")).isEqualTo(seatTakenBefore + 2);
+		assertThat(reservations(show)).isZero();
+		assertThat(heldCount(user, show)).isZero();
+	}
+
+	@Test
+	void aBestEffortRequestWithOneFreeSeatStillGoesIntoTheTransaction() throws Exception {
+		long show = newShow(4, 100, "A1", "A2");
+		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ? AND seat_label = 'A2'", show);
+
+		reserve(newUser(), show, "[\"A1\",\"A2\"]", "k1", "best_effort")
+				.andExpect(status().isCreated())
+				.andExpect(jsonPath("$.seats[0]").value("A1"))
+				.andExpect(jsonPath("$.unavailable_seats[0]").value("A2"));
+	}
+
+	@Test
+	void aSeatThatOnlyLookedFreeIsStillDecidedByTheGuardedUpdate() throws Exception {
+		long show = newShow(4, 100, "A1");
+		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ?", show);
+		String user = newUser();
+
+		// The early read is stale: it says A1 is free although it was taken a moment ago.
+		doReturn(Set.of("A1")).when(seatStore).findAvailableSeatLabels(anyLong(), anyCollection());
+		reserve(user, show, "[\"A1\"]", "k1", "all_or_nothing")
+				.andExpect(status().isConflict()).andExpect(jsonPath("$.error").value("seat-taken"));
+		reserve(user, show, "[\"A1\"]", "k2", "best_effort")
+				.andExpect(status().isConflict()).andExpect(jsonPath("$.error").value("seat-taken"));
+
+		verify(seatStore).claimSeats(show, List.of("A1"));
+		verify(seatStore).claimSeat(show, "A1");
+		assertThat(reservations(show)).isZero();
+		assertThat(keys(user, "k1")).isZero();
+		assertThat(heldCount(user, show)).isZero();
+	}
+
+	@Test
+	void allOrNothingClaimsEverySeatInOneStatement() throws Exception {
+		long show = newShow(4, 100, "A1", "A2", "A3");
+
+		reserve(newUser(), show, "[\"A3\",\"A1\",\"A2\"]", "k1", "all_or_nothing")
+				.andExpect(status().isCreated())
+				.andExpect(jsonPath("$.seats.length()").value(3))
+				.andExpect(jsonPath("$.amount_paise").value(300));
+
+		verify(seatStore).claimSeats(show, List.of("A1", "A2", "A3"));
+		verify(seatStore, never()).claimSeat(anyLong(), anyString());
+		assertThat(count("SELECT COUNT(*) FROM reservation_seats WHERE show_id = ?", show)).isEqualTo(3);
+		assertInvariants(show);
+	}
+
+	@Test
+	void allOrNothingThatLosesOneSeatInsideTheTransactionGivesTheOthersBack() throws Exception {
+		long show = newShow(4, 100, "A1", "A2", "A3");
+		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ? AND seat_label = 'A2'", show);
+		String user = newUser();
+
+		// The early read is stale (A2 looked free), so the one-statement claim wins only 2 of 3 and must roll back.
+		doReturn(Set.of("A1", "A2", "A3")).when(seatStore).findAvailableSeatLabels(anyLong(), anyCollection());
+		reserve(user, show, "[\"A1\",\"A2\",\"A3\"]", "k1", "all_or_nothing")
+				.andExpect(status().isConflict())
+				.andExpect(jsonPath("$.error").value("seat-taken"))
+				.andExpect(jsonPath("$.message").value("Seat(s) not available: A1, A2, A3"));
+
+		assertThat(seatStatus(show, "A1")).isEqualTo("available");
+		assertThat(seatStatus(show, "A3")).isEqualTo("available");
+		assertThat(reservations(show)).isZero();
+		assertThat(keys(user, "k1")).isZero();
+		assertThat(heldCount(user, show)).isZero();
+		assertThat(count("SELECT COUNT(*) FROM reservation_seats WHERE show_id = ?", show)).isZero();
+	}
+
+	@Test
+	void theSeatsAreReadBeforeTheKeySoAReplayIsNeverMistakenForATakenSeat() throws Exception {
+		long show = newShow(4, 100, "A1");
+		String user = newUser();
+		String id = reservationId(reserve(user, show, "[\"A1\"]", "k1", null).andExpect(status().isCreated()));
+		clearInvocations(seatStore);
+
+		// A1 is taken now, by this very reservation. The key decides: 201 with the original reservation.
+		reserve(user, show, "[\"A1\"]", "k1", null)
+				.andExpect(status().isCreated()).andExpect(jsonPath("$.reservation_id").value(id));
+
+		InOrder order = inOrder(seatStore);
+		order.verify(seatStore).findAvailableSeatLabels(anyLong(), anyCollection());
+		order.verify(seatStore).findIdempotencyKey(user, "k1");
+		verify(seatStore, never()).insertPendingReservation(anyString(), anyLong(), anyString());
+	}
+
+	@Test
+	void aTakenSeatIsReportedBeforeTheLimit() throws Exception {
+		long show = newShow(1, 100, "A1", "A2");
+		String user = newUser();
+		reserve(user, show, "[\"A1\"]", "k1", null).andExpect(status().isCreated());
+		jdbc.update("UPDATE seats SET status = 'confirmed' WHERE show_id = ? AND seat_label = 'A2'", show);
+
+		// Over the limit AND aimed at a taken seat: the seat is checked first, without a transaction.
+		reserve(user, show, "[\"A2\"]", "k2", null)
+				.andExpect(status().isConflict()).andExpect(jsonPath("$.error").value("seat-taken"));
+		assertThat(heldCount(user, show)).isEqualTo(1);
 	}
 
 	// ---- metrics and invariants over a mixed run ----
