@@ -178,8 +178,14 @@ def _raise_open_file_limit(needed):
                          f"Raise it first with: ulimit -n {needed}   (or pass a smaller --concurrency)")
 
 
+class NoResponse(Exception):
+    """The connection was closed before any answer arrived."""
+
+
 def _parse_response(raw):
     """Splits a raw HTTP/1.1 response read to the end of the connection into (status, body bytes)."""
+    if not raw:
+        raise NoResponse("the connection was closed without an answer")
     head, _, rest = raw.partition(b"\r\n\r\n")
     lines = head.split(b"\r\n")
     status = int(lines[0].split()[1])
@@ -202,18 +208,20 @@ def _parse_response(raw):
     return status, rest
 
 
-def fire(api, jobs, concurrency, timeout):
+def fire(api, jobs, concurrency, timeout, preopen=False):
     """
     Sends every job (method, path, token, body) and returns (status, answer, seconds) for each, in order.
     concurrency 0 means all at once: every request is started in the same instant, each on its own connection, and is
     sent the moment its connection opens. A number above 0 keeps at most that many requests in flight instead.
-    Also reports how many requests were in flight together at the peak. Standard library only (asyncio).
+    preopen opens every connection first, holds them, and then sends all requests in the same instant: over the
+    internet, opening a connection takes far longer than sending on one, so this is what makes the requests arrive
+    together. Also reports how many requests were in flight together at the peak. Standard library only (asyncio).
     """
     import asyncio
     import socket
     import ssl
 
-    at_once = concurrency <= 0
+    at_once = concurrency <= 0 or preopen
     _raise_open_file_limit((len(jobs) if at_once else concurrency) + 200)
     context = ssl.create_default_context() if api._https else None
     # Look the address up once, not 20,000 times, and prefer IPv4 (Docker forwards localhost over IPv4).
@@ -273,6 +281,58 @@ def fire(api, jobs, concurrency, timeout):
                     limit.release()
                 if writer is not None:
                     writer.close()
+
+        connections = [None] * len(jobs)
+        gentle = asyncio.Semaphore(500)
+
+        async def open_only(index, job):
+            last = "?"
+            for _ in range(3):
+                async with gentle:
+                    try:
+                        connections[index] = await asyncio.wait_for(
+                            asyncio.open_connection(address, api._port, ssl=context, server_hostname=api._host if context else None), 60)
+                        stats["connected"] += 1
+                        return
+                    except Exception as error:
+                        last = f"{type(error).__name__}: {error}"
+            results[index] = (0, {"error": "client-error", "message": "could not connect, " + last}, 0.0)
+            api.observe(job[0], job[1], 0, None)
+
+        async def answer_of(index, job):
+            reader, writer = connections[index]
+            try:
+                await writer.drain()
+                raw = await asyncio.wait_for(reader.read(), timeout)
+                status, body = _parse_response(raw)
+                text = body.decode("utf-8", "replace")
+                try:
+                    answer = json.loads(text)
+                except ValueError:
+                    answer = text
+                results[index] = (status, answer, time.perf_counter() - stats["fired_at"])
+                api.observe(job[0], job[1], status, answer)
+            except Exception as error:
+                results[index] = (0, {"error": "client-error", "message": f"{type(error).__name__}: {error}"},
+                                  time.perf_counter() - stats["fired_at"])
+                api.observe(job[0], job[1], 0, None)
+            finally:
+                writer.close()
+
+        if preopen:
+            await asyncio.gather(*[open_only(i, job) for i, job in enumerate(jobs)])
+            stats["open_seconds"] = time.perf_counter() - began
+            ready = [(i, job, request_bytes(*job)) for i, job in enumerate(jobs) if connections[i] is not None]
+            # The burst: one write per open connection, nothing else in between.
+            stats["fired_at"] = time.perf_counter()
+            stats["first_sent_clock"] = time.time()
+            for i, _, payload in ready:
+                connections[i][1].write(payload)
+            stats["last_sent_clock"] = time.time()
+            stats["last_sent_after"] = stats["last_sent_clock"] - stats["first_sent_clock"]
+            stats["peak_in_flight"] = len(ready)
+            await asyncio.gather(*[answer_of(i, job) for i, job, _ in ready])
+            return
 
         stats["fired_at"] = time.perf_counter()
         await asyncio.gather(*[one(i, job) for i, job in enumerate(jobs)])
@@ -458,6 +518,7 @@ def scenario_storm(api, report, args, tag):
     seat_count, per_user_limit = 200, 4
     seats = [f"S{i}" for i in range(1, seat_count + 1)]
     name = f"storm: {args.requests} requests, one show, {seat_count} seats, " + (
+"opened first, sent together" if args.preopen else
         "all at once" if args.concurrency <= 0 else f"{args.concurrency} in flight at a time")
     show = api.create_show(f"load-storm-{tag}", seats, per_user_limit=per_user_limit)
     rng = random.Random(7)
@@ -537,7 +598,7 @@ def scenario_storm(api, report, args, tag):
 
     rng.shuffle(plan)
 
-    # The checker: reads the show the whole time and adds up the counts.
+    # The checker: reads the show every 2 seconds for as long as the burst runs and adds up the counts.
     stop = threading.Event()
     samples, broken = [0], []
 
@@ -549,20 +610,28 @@ def scenario_storm(api, report, args, tag):
                 samples[0] += 1
                 if counts["available"] + counts["held"] + counts["confirmed"] != view["total_seats"] or len(view["seats"]) != seat_count:
                     broken.append(counts)
-            stop.wait(0.2)
+            stop.wait(2)
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
 
-    how = "all at once" if args.concurrency <= 0 else f"{args.concurrency} in flight at a time"
+    how = ("every connection opened first, then all sent together" if args.preopen
+           else "all at once" if args.concurrency <= 0 else f"{args.concurrency} in flight at a time")
     print(f"   firing {len(plan)} requests, {how} ...", flush=True)
     jobs = [(method, path, tokens[user], body) for (_, user, method, path, body) in plan]
-    results, stats = fire(api, jobs, args.concurrency, max(args.timeout, 600))
+    results, stats = fire(api, jobs, args.concurrency, max(args.timeout, 600), preopen=args.preopen)
     seconds = time.perf_counter() - stats["fired_at"]
     stop.set()
     watcher.join(timeout=30)
-    print(f"   {stats['connected']} of {len(plan)} connections opened, the last request was sent {stats['last_sent_after']:.1f}s after the first, "
-          f"and at the peak {stats['peak_in_flight']} requests were in flight together")
+    if args.preopen:
+        def clock(since_epoch):
+            return time.strftime("%H:%M:%S", time.gmtime(since_epoch)) + f".{int(since_epoch % 1 * 1000):03d}"
+        print(f"   {stats['connected']} of {len(plan)} connections opened in {stats['open_seconds']:.1f}s and held open")
+        print(f"   first request sent at {clock(stats['first_sent_clock'])} UTC, last at {clock(stats['last_sent_clock'])} UTC: "
+              f"{1000 * stats['last_sent_after']:.0f} ms apart, {stats['peak_in_flight']} requests in flight together")
+    else:
+        print(f"   {stats['connected']} of {len(plan)} connections opened, the last request was sent {stats['last_sent_after']:.1f}s after the first, "
+              f"and at the peak {stats['peak_in_flight']} requests were in flight together")
     failures = Counter(a.get("message", "?").split(":")[0] for s_, a, _ in results if s_ == 0 and isinstance(a, dict))
     if failures:
         print(f"   requests that got no answer, by cause: {dict(failures.most_common(5))}")
@@ -726,6 +795,8 @@ def main():
     parser.add_argument("--requests", type=int, default=20000, help="storm: total requests (default 20000)")
     parser.add_argument("--concurrency", type=int, default=0,
                         help="storm: 0 (default) sends every request at once, a number keeps at most that many in flight")
+    parser.add_argument("--preopen", action="store_true",
+                        help="storm: open every connection first, hold them, then send all requests in the same instant")
     parser.add_argument("--hot-seats", type=int, default=5, help="storm: number of hot seats (default 5)")
     parser.add_argument("--no-reconcile", action="store_true", help="skip the database reconciliation (for a remote app)")
     parser.add_argument("--reconcile-command", default="docker compose exec -T mysql mysql -N -useat -pdev-only-password seat_reservation",

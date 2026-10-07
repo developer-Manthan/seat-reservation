@@ -1,0 +1,72 @@
+# Fires the burst at a deployed app from a GitHub machine. Started by hand: Actions -> Burst test -> Run workflow.
+# Needs one repository secret, PROD_ADMIN_TOKEN (the ADMIN_TOKEN of the deployed app). The probe does not need it.
+name: Burst test
+
+on:
+  workflow_dispatch:
+    inputs:
+      what:
+        description: "probe = open the connections and call /healthz (creates no data). burst = the real 20,000 reservation requests."
+        type: choice
+        options: [probe, burst]
+        default: probe
+      requests:
+        description: "How many requests (or connections, for the probe)"
+        default: "20000"
+      mode:
+        description: "burst only. preopen = open every connection first, then send all together."
+        type: choice
+        options: [preopen, all-at-once, capped-1000]
+        default: preopen
+      base_url:
+        description: "The app to fire at"
+        default: "https://seat-booking.up.railway.app"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: burst
+  cancel-in-progress: false
+
+jobs:
+  burst:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BASE_URL: ${{ inputs.base_url }}
+      REQUESTS: ${{ inputs.requests }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: This machine
+        run: |
+          echo "cores: $(nproc)"
+          free -g | sed -n 2p
+          echo "open files allowed: $(ulimit -Hn)"
+
+      - name: Allow enough connections
+        run: |
+          # One open connection is one open file and one local port.
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+
+      - name: Probe (open the connections, call /healthz on all at once)
+        if: inputs.what == 'probe'
+        run: sudo prlimit --nofile=100000:100000 python3 scripts/preopen_probe.py "$BASE_URL" "$REQUESTS"
+
+      - name: Burst
+        if: inputs.what == 'burst'
+        env:
+          ADMIN_TOKEN: ${{ secrets.PROD_ADMIN_TOKEN }}
+        run: |
+          if [ -z "$ADMIN_TOKEN" ]; then
+            echo "Add the repository secret PROD_ADMIN_TOKEN first (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
+          case "$MODE" in
+            preopen)     extra="--preopen" ;;
+            capped-1000) extra="--concurrency 1000" ;;
+            *)           extra="" ;;
+          esac
+          sudo --preserve-env=BASE_URL,ADMIN_TOKEN,REQUESTS prlimit --nofile=100000:100000 bash burst.sh $extra
