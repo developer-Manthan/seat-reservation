@@ -422,7 +422,11 @@ def main():
     watcher.join(timeout=60)
 
     print("4. check", flush=True)
-    check_everything(show, users, victims, tokens, requests, answers, samples)
+    try:
+        check_everything(show, users, victims, tokens, requests, answers, samples)
+    except (http.client.HTTPException, OSError) as error:
+        # The checks read from the app. If it no longer answers, say so instead of stopping with a stack trace.
+        check("the app still answers after the burst", False, f"{type(error).__name__}: {error}")
 
     print(f"\nRESULT: {'FAILED, ' + str(len(failed)) + ' check(s)' if failed else 'PASSED, every check held.'}")
     sys.exit(1 if failed else 0)
