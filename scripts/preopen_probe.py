@@ -36,7 +36,21 @@ except (ImportError, ValueError, OSError) as problem:
     print(f"could not read or raise the open-file limit: {problem}", flush=True)
 
 context = ssl.create_default_context() if https else None
-address = sorted(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM), key=lambda i: i[0] != socket.AF_INET)[0][4][0]
+family, _, _, _, found = sorted(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM), key=lambda i: i[0] != socket.AF_INET)[0]
+address = found[0]
+# Every connection needs its own local port. The system's own range can be small (about 6,000 on Railway), so each
+# connection is given a port from this larger range. Set LOCAL_PORTS=system to let the system choose again.
+import itertools
+import os
+own_ports = os.environ.get("LOCAL_PORTS") != "system"
+local_ports = itertools.cycle(range(10000, 65000))
+any_local_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
+try:
+    with open("/proc/sys/net/ipv4/ip_local_port_range") as setting:
+        print(f"the system's own local ports: {' to '.join(setting.read().split())}; "
+              f"this run uses {'10000 to 64999' if own_ports else 'those'}", flush=True)
+except OSError:
+    pass
 request = f"GET /healthz HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
 
 
@@ -51,11 +65,12 @@ async def main():
 
     async def open_one():
         last = "?"
-        for _ in range(3):
+        for _ in range(5):
             async with gate:
                 try:
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(address, port, ssl=context, server_hostname=host if https else None), 60)
+                    local = (any_local_address, next(local_ports)) if own_ports else None
+                    reader, writer = await asyncio.wait_for(asyncio.open_connection(
+                        address, port, ssl=context, server_hostname=host if https else None, local_addr=local), 60)
                     opened.append((reader, writer, time.perf_counter()))
                     if len(opened) % 1000 == 0:
                         print(f"   {len(opened)} open after {time.perf_counter() - began:.0f}s, "
