@@ -29,8 +29,11 @@ try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     wanted = total + 500
     resource.setrlimit(resource.RLIMIT_NOFILE, (wanted if hard == resource.RLIM_INFINITY else min(hard, wanted), hard))
-except (ImportError, ValueError, OSError):
-    pass
+    now, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    print(f"open files this process may have: {now} (the system's ceiling is "
+          f"{'unlimited' if hard == resource.RLIM_INFINITY else hard}, this run needs about {wanted})", flush=True)
+except (ImportError, ValueError, OSError) as problem:
+    print(f"could not read or raise the open-file limit: {problem}", flush=True)
 
 context = ssl.create_default_context() if https else None
 address = sorted(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM), key=lambda i: i[0] != socket.AF_INET)[0][4][0]
@@ -59,7 +62,10 @@ async def main():
                               f"failed attempts so far: {dict(failed_attempts)}", flush=True)
                     return
                 except Exception as error:
-                    last = type(error).__name__
+                    # The reason in words, for example "OSError 24: Too many open files".
+                    number = getattr(error, "errno", None)
+                    text = getattr(error, "strerror", None) or str(error)
+                    last = f"{type(error).__name__}{' ' + str(number) if number else ''}: {text}"[:90]
                     failed_attempts[last] += 1
         gave_up[last] += 1
 

@@ -9,6 +9,7 @@ How it works, top to bottom:
     1. set up     create the show, the users and a few bookings to attack
     2. plan       decide who asks for what (five groups, see plan_burst)
     3. fire       open one connection per request, hold them all, then send every request together
+                  (from several sender processes when one process may not hold that many connections)
     4. check      the six acceptance points, each printed as PASS or FAIL
 
 Standard library only. The exit code is 0 when every check passed.
@@ -17,6 +18,7 @@ import asyncio
 import http.client
 import io
 import json
+import multiprocessing
 import os
 import socket
 import ssl
@@ -25,7 +27,7 @@ import threading
 import time
 import uuid
 from collections import Counter, namedtuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080")
@@ -186,16 +188,60 @@ def parse_answer(raw):
     return response.status, as_json(response.read())
 
 
-async def fire(requests, tokens):
+def fire(requests, tokens):
     """
     Opens one connection per request, holds them all open, then sends every request in the same instant.
     Returns one (status, body) per request, in order. Status 0 means no answer, and body says why.
+
+    A process may only hold a limited number of open connections, so the requests are dealt out to as many sender
+    processes as that limit needs. Every sender opens its share and then waits at a barrier. The barrier lets them
+    all go at the same moment, so the burst is still one burst.
     """
+    payloads = [as_bytes(request, tokens[request.user]) for request in requests]
+    senders = senders_needed(len(payloads))
+    shares = [list(range(sender, len(payloads), senders)) for sender in range(senders)]     # dealt out like cards
+    print(f"   {senders} sender process(es), up to {len(shares[0])} connections each", flush=True)
+
+    # "spawn" starts each sender as a fresh process. The default on Linux (a copy of this one) is unsafe here,
+    # because the thread that watches the show is already running.
+    fresh = multiprocessing.get_context("spawn")
+    barrier = fresh.Barrier(senders)
+    with ProcessPoolExecutor(max_workers=senders, mp_context=fresh, initializer=_join_barrier, initargs=(barrier,)) as pool:
+        results = list(pool.map(send_share, [[payloads[index] for index in share] for share in shares]))
+
+    answers = [None] * len(payloads)
+    for share, (share_answers, _, _, _) in zip(shares, results):
+        for index, answer in zip(share, share_answers):
+            answers[index] = answer
+    opened = sum(count for _, count, _, _ in results)
+    first = min(first for _, _, first, _ in results)
+    last = max(last for _, _, _, last in results)
+    print(f"   {opened} of {len(payloads)} connections were opened and held open")
+    print(f"   first request sent at {clock(first)} UTC, last at {clock(last)} UTC: {1000 * (last - first):.0f} ms apart")
+    return answers
+
+
+_barrier = None
+
+
+def _join_barrier(barrier):
+    """Runs once in every sender process: remember the barrier all senders wait at."""
+    global _barrier
+    _barrier = barrier
+
+
+def send_share(payloads):
+    """One sender process. Returns (answers, connections opened, time of its first send, time of its last send)."""
+    allow_open_files(len(payloads) + 100)
+    return asyncio.run(_send_share(payloads))
+
+
+async def _send_share(payloads):
     # Look the name up once, not once per connection. IPv4 first: Docker forwards localhost over IPv4.
     found = socket.getaddrinfo(HOST, PORT, type=socket.SOCK_STREAM)
     address = sorted(found, key=lambda entry: entry[0] != socket.AF_INET)[0][4][0]
-    payloads = [as_bytes(request, tokens[request.user]) for request in requests]
-    connections = [None] * len(requests)
+    connections = [None] * len(payloads)
+    why_not = {}        # index -> the reason its connection could not be opened
     gate = asyncio.Semaphore(OPEN_AT_A_TIME)
 
     async def open_one(index):
@@ -205,12 +251,12 @@ async def fire(requests, tokens):
                     connections[index] = await asyncio.wait_for(
                         asyncio.open_connection(address, PORT, ssl=TLS, server_hostname=HOST if TLS else None), 30)
                     return
-                except (OSError, asyncio.TimeoutError):
-                    pass
+                except (OSError, asyncio.TimeoutError) as error:
+                    why_not[index] = f"could not connect: {getattr(error, 'strerror', None) or type(error).__name__}"
 
     async def read_one(index):
         if connections[index] is None:
-            return 0, "could not connect"
+            return 0, why_not.get(index, "could not connect")
         reader, writer = connections[index]
         try:
             await writer.drain()
@@ -221,20 +267,17 @@ async def fire(requests, tokens):
         finally:
             writer.close()
 
-    started = time.perf_counter()
-    await asyncio.gather(*[open_one(index) for index in range(len(requests))])
+    await asyncio.gather(*[open_one(index) for index in range(len(payloads))])
     opened = [index for index, connection in enumerate(connections) if connection is not None]
-    print(f"   {len(opened)} of {len(requests)} connections opened in {time.perf_counter() - started:.1f}s and held open", flush=True)
 
+    _barrier.wait(timeout=300)      # every sender has its connections open: go
     first = time.time()
     for index in opened:
         connections[index][1].write(payloads[index])
     last = time.time()
-    print(f"   first request sent at {clock(first)} UTC, last at {clock(last)} UTC: {1000 * (last - first):.0f} ms apart", flush=True)
 
-    answers = await asyncio.gather(*[read_one(index) for index in range(len(requests))])
-    print(f"   last answer arrived {time.time() - first:.1f}s after the first request was sent")
-    return answers
+    answers = await asyncio.gather(*[read_one(index) for index in range(len(payloads))])
+    return answers, len(opened), first, last
 
 
 def clock(since_epoch):
@@ -242,17 +285,31 @@ def clock(since_epoch):
 
 
 def allow_open_files(needed):
-    """One open connection is one open file. Raise this process's limit as far as the system allows."""
+    """
+    One open connection is one open file. Raises this process's limit as far as the system allows and returns how
+    many files it may now have open (None where there is no such limit, as on Windows).
+    """
     try:
         import resource
-    except ImportError:         # Windows has no such limit
-        return
+    except ImportError:
+        return None
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     wanted = needed if hard == resource.RLIM_INFINITY else min(needed, hard)
     if wanted > soft:
         resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
-    if wanted < needed:
-        print(f"   WARNING: this system allows {wanted} open connections, the burst needs {needed}")
+    return max(wanted, soft)
+
+
+def senders_needed(connections):
+    """How many sender processes it takes to hold this many connections. SENDERS overrides it."""
+    if os.environ.get("SENDERS"):
+        return int(os.environ["SENDERS"])
+    limit = allow_open_files(connections + 100)
+    if limit is None:
+        return 1
+    per_sender = limit - 200        # leave room for the files Python itself keeps open
+    print(f"   a process may have {limit} files open here, so one sender can hold {per_sender} connections", flush=True)
+    return -(-connections // per_sender)      # rounded up
 
 
 # ---------------------------------------------------------------- the checks
@@ -369,7 +426,6 @@ def main():
     print(f"   {dict(Counter(request.group for request in requests))}", flush=True)
 
     print("3. fire", flush=True)
-    allow_open_files(len(requests) + 100)
     samples, burst_over = [], threading.Event()
 
     def watch():        # reads the show every 2 seconds for as long as the burst runs
@@ -383,7 +439,7 @@ def main():
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
-    answers = asyncio.run(fire(requests, tokens))
+    answers = fire(requests, tokens)
     burst_over.set()
     watcher.join(timeout=60)
 
