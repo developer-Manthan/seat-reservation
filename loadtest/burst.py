@@ -42,6 +42,7 @@ SEATS = [f"S{number}" for number in range(1, 201)]
 HOT_SEATS = SEATS[:5]
 PER_USER_LIMIT = 4
 OPEN_AT_A_TIME = 500
+OPEN_TIMEOUT = 10       # seconds to wait for one connection to open
 FIRST_LOCAL_PORT, LAST_LOCAL_PORT = 10000, 65000      # the local ports the burst's connections use
 
 # How many users each small group has. Everyone else is in the "hot" group.
@@ -209,12 +210,12 @@ async def fire(requests, tokens):
     gate = asyncio.Semaphore(OPEN_AT_A_TIME)
 
     async def open_one(index):
-        for _ in range(5):      # a port may be taken by something else: try the next one
+        for _ in range(3):      # a port may be taken by something else: try the next one
             async with gate:
                 try:
                     connections[index] = await asyncio.wait_for(asyncio.open_connection(
                         target[0], PORT, ssl=TLS, server_hostname=HOST if TLS else None,
-                        local_addr=(any_local_address, next(local_ports))), 30)
+                        local_addr=(any_local_address, next(local_ports))), OPEN_TIMEOUT)
                     return
                 except (OSError, asyncio.TimeoutError) as error:
                     why_not[index] = f"could not connect: {getattr(error, 'strerror', None) or type(error).__name__}"
@@ -232,8 +233,18 @@ async def fire(requests, tokens):
         finally:
             writer.close()
 
+    async def report_progress():        # a sign of life every 5 seconds while the connections are being opened
+        while True:
+            await asyncio.sleep(5)
+            open_now = sum(1 for connection in connections if connection is not None)
+            reasons = dict(Counter(why_not.values()))
+            print(f"   ... {open_now} open after {time.perf_counter() - started:.0f}s" + (f", failed attempts: {reasons}" if reasons else ""),
+                  flush=True)
+
     started = time.perf_counter()
+    progress = asyncio.create_task(report_progress())
     await asyncio.gather(*[open_one(index) for index in range(len(requests))])
+    progress.cancel()
     opened = [index for index, connection in enumerate(connections) if connection is not None]
     print(f"   {len(opened)} of {len(requests)} connections opened in {time.perf_counter() - started:.1f}s and held open", flush=True)
 
